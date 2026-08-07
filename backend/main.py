@@ -1,5 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from typing import List
 import os
 import shutil
@@ -154,3 +156,17 @@ async def chat(
         await database.add_message(chat_id, "ai", response)
         
     return {"response": response, "chat_id": chat_id}
+
+# --- Serve React Frontend ---
+frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
+
+if os.path.exists(frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+
+    @app.get("/")
+    async def serve_react_app_root():
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
+
+    @app.get("/{catchall:path}")
+    async def serve_react_app(catchall: str):
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
