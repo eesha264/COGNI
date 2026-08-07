@@ -1,0 +1,56 @@
+:root {
+  --bg-app-dark: #222329;
+  --bg-app-light: #FFFFFF;
+  --text-dark-primary: #FFFFFF;
+  --text-dark-secondary: #90929B;
+  --text-light-primary: #1F2024;
+  --text-light-secondary: #747682;
+  --accent-orange: #F96C42;
+  --bg-hover-dark: #2E2F37;
+  --bg-input-light: #F4F4F6;
+  --border-light: #EBEBEB;
+  --gradient-pro: linear-gradient(135deg, #FF8C4B 0%, #FF5050 100%);
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-family);
+  background-color: var(--bg-app-dark);
+  height: 100vh;
+  margin: 0;
+  display: flex;
+  overflow: hidden;
+  color: var(--text-light-primary);
+}
+
+.app-container {
+  width: 100vw;
+  height: 100vh;
+  background-color: var(--bg-app-dark);
+  display: flex;
+  overflow: hidden;
+}
+
+/* Base button styles */
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-family: var(--font-family);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}

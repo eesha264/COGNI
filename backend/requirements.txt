@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+langchain
+langchain-groq
+chromadb
+pymupdf
+python-multipart
+websockets
+langchain-text-splitters
+fastembed
+langchain-community
+motor
