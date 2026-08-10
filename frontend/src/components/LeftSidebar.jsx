@@ -24,8 +24,8 @@ function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectC
         <div className="recent-chats-section">
           <div className="recent-chats-header">Recent Chats</div>
           {chats && chats.map((chat) => (
-            <div 
-              key={chat.id} 
+            <div
+              key={chat.id}
               className={`recent-chat-item ${activeChatId === chat.id ? 'active' : ''}`}
               onClick={() => onSelectChat(chat.id)}
             >
@@ -33,8 +33,8 @@ function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectC
                 <span className="chat-icon">💬</span>
                 <span className="chat-title">{chat.title}</span>
               </div>
-              <button 
-                className="delete-chat-btn" 
+              <button
+                className="delete-chat-btn"
                 onClick={(e) => {
                   e.stopPropagation();
                   onDeleteChat(chat.id);
@@ -51,7 +51,7 @@ function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectC
             </div>
           ))}
           {(!chats || chats.length === 0) && (
-            <div style={{padding: '0 16px', fontSize: '12px', color: 'var(--text-dark-secondary)'}}>
+            <div style={{ padding: '0 16px', fontSize: '12px', color: 'var(--text-dark-secondary)' }}>
               No recent chats
             </div>
           )}

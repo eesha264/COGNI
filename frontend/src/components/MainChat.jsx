@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
 import './MainChat.css';
 
@@ -9,15 +9,12 @@ const renderMarkdown = (text) => {
   const lines = text.split('\n');
   const elements = [];
   let tableRows = [];
-  let inTable = false;
-  let inList = false;
   let listItems = [];
 
   const flushList = (key) => {
     if (listItems.length > 0) {
       elements.push(<ul key={`list-${key}`}>{listItems}</ul>);
       listItems = [];
-      inList = false;
     }
   };
 
@@ -49,7 +46,6 @@ const renderMarkdown = (text) => {
         </table>
       );
       tableRows = [];
-      inTable = false;
     }
   };
 
@@ -70,7 +66,6 @@ const renderMarkdown = (text) => {
     // Table Row detection (starts and ends with |)
     if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
       flushList(index);
-      inTable = true;
       const cells = trimmed.split('|').slice(1, -1);
       tableRows.push(cells);
       return;
@@ -80,7 +75,6 @@ const renderMarkdown = (text) => {
 
     // Bullet list detection
     if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-      inList = true;
       listItems.push(<li key={`li-${index}`}>{parseInline(trimmed.substring(2))}</li>);
       return;
     } else {
@@ -105,7 +99,7 @@ const renderMarkdown = (text) => {
   return elements;
 };
 
-function MainChat({ apiKey, isUploading, isProcessed, onFileUpload, deviceId, activeChatId, setActiveChatId, fetchChats, resetKey }) {
+function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, setActiveChatId, fetchChats, resetKey }) {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
   const [isAiTyping, setIsAiTyping] = useState(false);

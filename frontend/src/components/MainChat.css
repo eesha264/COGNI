@@ -106,7 +106,9 @@
   margin-bottom: 0;
 }
 
-.markdown-render h2, .markdown-render h3, .markdown-render h4 {
+.markdown-render h2,
+.markdown-render h3,
+.markdown-render h4 {
   margin-top: 16px;
   margin-bottom: 8px;
   font-weight: 600;
@@ -128,10 +130,11 @@
   background-color: white;
   border-radius: 8px;
   overflow: hidden;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
-.markdown-table th, .markdown-table td {
+.markdown-table th,
+.markdown-table td {
   padding: 12px 16px;
   border: 1px solid var(--border-light);
   text-align: left;
@@ -166,8 +169,16 @@
 }
 
 @keyframes bounce {
-  0%, 80%, 100% { transform: scale(0); }
-  40% { transform: scale(1); }
+
+  0%,
+  80%,
+  100% {
+    transform: scale(0);
+  }
+
+  40% {
+    transform: scale(1);
+  }
 }
 
 /* Chat Input Container */
@@ -185,7 +196,8 @@
   margin-bottom: 12px;
 }
 
-.attach-btn, .voice-btn {
+.attach-btn,
+.voice-btn {
   width: 36px;
   height: 36px;
   display: flex;
@@ -202,7 +214,9 @@
 }
 
 @keyframes rotate {
-  100% { transform: rotate(360deg); }
+  100% {
+    transform: rotate(360deg);
+  }
 }
 
 .chat-input {

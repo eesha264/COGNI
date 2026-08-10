@@ -44,9 +44,23 @@
   background: #fff7f0;
 }
 
-.upload-icon-wrap { font-size: 42px; margin-bottom: 16px; display: block; }
-.upload-title     { font-size: 15px; font-weight: 600; color: #111827; margin-bottom: 6px; }
-.upload-hint      { font-size: 12px; color: #9ca3af; }
+.upload-icon-wrap {
+  font-size: 42px;
+  margin-bottom: 16px;
+  display: block;
+}
+
+.upload-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+  margin-bottom: 6px;
+}
+
+.upload-hint {
+  font-size: 12px;
+  color: #9ca3af;
+}
 
 /* ═══════════════════════════════════════════════════════
    STATE 2 — CSS Grid process graph
@@ -73,13 +87,55 @@
 }
 
 /* ── Grid area assignments for card wrapper divs ── */
-.ga-c1r1 { grid-area: c1r1; display: flex; align-items: center; justify-content: center; }
-.ga-c3r1 { grid-area: c3r1; display: flex; align-items: center; justify-content: center; }
-.ga-c1r2 { grid-area: c1r2; display: flex; align-items: center; justify-content: center; }
-.ga-c3r2 { grid-area: c3r2; display: flex; align-items: center; justify-content: center; }
-.ga-c1r3 { grid-area: c1r3; display: flex; align-items: center; justify-content: center; }
-.ga-c3r3 { grid-area: c3r3; display: flex; align-items: center; justify-content: center; }
-.ga-done { grid-area: done; display: flex; justify-content: center; align-items: center; padding: 12px 0; }
+.ga-c1r1 {
+  grid-area: c1r1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-c3r1 {
+  grid-area: c3r1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-c1r2 {
+  grid-area: c1r2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-c3r2 {
+  grid-area: c3r2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-c1r3 {
+  grid-area: c1r3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-c3r3 {
+  grid-area: c3r3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ga-done {
+  grid-area: done;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 12px 0;
+}
 
 /* Horizontal connector cells — assigned via grid-area attr on the component */
 .grid-h {
@@ -89,9 +145,17 @@
   padding-bottom: 32px;
 }
 
-.ga-h1  { grid-area: h1; }
-.ga-h2  { grid-area: h2; }
-.ga-h3  { grid-area: h3; }
+.ga-h1 {
+  grid-area: h1;
+}
+
+.ga-h2 {
+  grid-area: h2;
+}
+
+.ga-h3 {
+  grid-area: h3;
+}
 
 .h-line {
   width: 100%;
@@ -101,7 +165,9 @@
   transition: background 0.5s ease;
 }
 
-.h-line.filled { background: linear-gradient(90deg, #10B981, #059669); }
+.h-line.filled {
+  background: linear-gradient(90deg, #10B981, #059669);
+}
 
 /* Vertical connector cells */
 .grid-v {
@@ -110,9 +176,17 @@
   align-items: stretch;
 }
 
-.ga-vd1 { grid-area: vd1; }
-.ga-vd2 { grid-area: vd2; }
-.ga-vd3 { grid-area: vd3; }
+.ga-vd1 {
+  grid-area: vd1;
+}
+
+.ga-vd2 {
+  grid-area: vd2;
+}
+
+.ga-vd3 {
+  grid-area: vd3;
+}
 
 .v-line {
   width: 3px;
@@ -122,7 +196,9 @@
   transition: background 0.5s ease;
 }
 
-.v-line.filled { background: linear-gradient(180deg, #10B981, #059669); }
+.v-line.filled {
+  background: linear-gradient(180deg, #10B981, #059669);
+}
 
 /* ═══════════════════════════════════════════════════════
    Step Cards
@@ -140,14 +216,14 @@
   border-radius: 16px;
   border: 1.5px solid #e5e7eb;
   background: #ffffff;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
   transition: all 0.3s ease;
 }
 
 .step-card.active {
   border-color: #f97316;
   background: #fff7f0;
-  box-shadow: 0 0 0 3px rgba(249,115,22,0.12), 0 2px 8px rgba(0,0,0,0.06);
+  box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.12), 0 2px 8px rgba(0, 0, 0, 0.06);
 }
 
 .step-card.completed {
@@ -172,7 +248,7 @@
 .step-card.completed .step-circle {
   background: #10B981;
   border-color: #10B981;
-  box-shadow: 0 0 0 4px rgba(16,185,129,0.15);
+  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.15);
 }
 
 .step-card.active .step-circle {
@@ -181,17 +257,23 @@
   animation: ring-pulse 1.8s ease-in-out infinite;
 }
 
-.check-icon { width: 13px; height: 13px; color: #ffffff; }
+.check-icon {
+  width: 13px;
+  height: 13px;
+  color: #ffffff;
+}
 
 .pulse-dot {
-  width: 9px; height: 9px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
   background: #f97316;
   animation: dot-pulse 1.2s ease-in-out infinite;
 }
 
 .idle-dot {
-  width: 9px; height: 9px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
   background: #d1d5db;
 }
@@ -202,7 +284,9 @@
   transition: filter 0.3s;
 }
 
-.step-card.pending .card-icon { filter: grayscale(1) opacity(0.3); }
+.step-card.pending .card-icon {
+  filter: grayscale(1) opacity(0.3);
+}
 
 .card-label {
   font-size: 11px;
@@ -213,19 +297,40 @@
   transition: color 0.3s;
 }
 
-.step-card.active .card-label    { color: #f97316; }
-.step-card.completed .card-label { color: #059669; }
+.step-card.active .card-label {
+  color: #f97316;
+}
+
+.step-card.completed .card-label {
+  color: #059669;
+}
 
 /* ═══════════════════════════════════════════════════════
    Animations
 ═══════════════════════════════════════════════════════ */
 
 @keyframes ring-pulse {
-  0%,100% { box-shadow: 0 0 0 3px rgba(249,115,22,0.15); }
-  50%      { box-shadow: 0 0 0 8px rgba(249,115,22,0.05); }
+
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.15);
+  }
+
+  50% {
+    box-shadow: 0 0 0 8px rgba(249, 115, 22, 0.05);
+  }
 }
 
 @keyframes dot-pulse {
-  0%,100% { transform: scale(1);   opacity: 1;   }
-  50%      { transform: scale(1.4); opacity: 0.7; }
+
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: scale(1.4);
+    opacity: 0.7;
+  }
 }

@@ -66,7 +66,7 @@ function App() {
     }
   };
 
-  const fetchChats = async () => {
+  const fetchChats = React.useCallback(async () => {
     try {
       const res = await fetch(`http://127.0.0.1:8000/chats/${deviceId}`);
       if (res.ok) {
@@ -76,11 +76,11 @@ function App() {
     } catch (err) {
       console.error("Error fetching chats", err);
     }
-  };
+  }, [deviceId]);
 
   useEffect(() => {
     fetchChats();
-  }, [deviceId]);
+  }, [deviceId, fetchChats]);
 
   const handleNewChat = () => {
     setActiveChatId(null);

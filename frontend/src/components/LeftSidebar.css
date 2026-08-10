@@ -60,7 +60,8 @@
   gap: 12px;
 }
 
-.nav-item:hover, .nav-item.active {
+.nav-item:hover,
+.nav-item.active {
   background-color: var(--bg-hover-dark);
   color: var(--text-dark-primary);
 }
