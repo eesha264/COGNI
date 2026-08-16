@@ -77,8 +77,31 @@
   justify-content: flex-start;
 }
 
-.message-bubble {
+.message-group {
+  display: flex;
+  flex-direction: column;
   max-width: 80%;
+  min-width: 0;
+}
+
+.user-align .message-group {
+  align-items: flex-end;
+}
+
+.ai-align .message-group {
+  align-items: flex-start;
+}
+
+.message-timestamp {
+  font-size: 10px;
+  color: var(--text-light-secondary);
+  margin-top: 4px;
+  padding: 0 6px;
+}
+
+.message-bubble {
+  position: relative;
+  max-width: 100%;
   padding: 16px 20px;
   border-radius: 16px;
   font-size: 15px;
@@ -95,6 +118,59 @@
   background-color: var(--bg-input-light);
   color: var(--text-light-primary);
   border-bottom-left-radius: 4px;
+  padding-right: 40px;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-light-secondary);
+  background-color: transparent;
+  opacity: 0;
+  transition: opacity 0.15s, background-color 0.15s;
+}
+
+.message-bubble:hover .copy-btn {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  background-color: rgba(0, 0, 0, 0.06);
+  color: var(--text-light-primary);
+}
+
+.source-footer {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-light);
+  font-size: 11px;
+  color: var(--text-light-secondary);
+}
+
+.scroll-to-bottom-btn {
+  position: absolute;
+  bottom: 110px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background-color: var(--text-light-primary);
+  color: white;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 5;
 }
 
 /* Markdown elements styling inside chat bubble */
@@ -106,15 +182,19 @@
   margin-bottom: 0;
 }
 
+.markdown-render h1,
 .markdown-render h2,
 .markdown-render h3,
-.markdown-render h4 {
+.markdown-render h4,
+.markdown-render h5,
+.markdown-render h6 {
   margin-top: 16px;
   margin-bottom: 8px;
   font-weight: 600;
 }
 
-.markdown-render ul {
+.markdown-render ul,
+.markdown-render ol {
   margin-left: 20px;
   margin-bottom: 12px;
 }
@@ -123,7 +203,20 @@
   margin-bottom: 4px;
 }
 
-.markdown-table {
+.markdown-render a {
+  color: var(--accent-orange);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-render blockquote {
+  border-left: 3px solid var(--accent-orange);
+  padding-left: 14px;
+  margin: 12px 0;
+  color: var(--text-light-secondary);
+}
+
+.markdown-render table {
   width: 100%;
   border-collapse: collapse;
   margin: 16px 0;
@@ -133,16 +226,44 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
-.markdown-table th,
-.markdown-table td {
+.markdown-render th,
+.markdown-render td {
   padding: 12px 16px;
   border: 1px solid var(--border-light);
   text-align: left;
 }
 
-.markdown-table th {
+.markdown-render th {
   background-color: #F9FAFB;
   font-weight: 600;
+}
+
+/* Inline code (not inside a fenced code block) */
+.markdown-render :not(pre) > code {
+  background-color: rgba(0, 0, 0, 0.06);
+  color: var(--text-light-primary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.9em;
+}
+
+/* Fenced code blocks (syntax-highlighted via rehype-highlight + github-dark theme,
+   which supplies its own background/text colors on the <code> element — this block
+   only handles layout so it doesn't fight the theme's contrast) */
+.markdown-render pre {
+  margin: 12px 0;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.markdown-render pre code {
+  display: block;
+  overflow-x: auto;
+  padding: 16px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.85em;
+  line-height: 1.5;
 }
 
 /* Typing indicator */

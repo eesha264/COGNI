@@ -1,115 +1,87 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
+import 'highlight.js/styles/github-dark.css';
 import './MainChat.css';
 
-// A simple Markdown parser to render clean headers, tables, bold text, and bullet points
+// Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
+// lists, blockquotes, links, and fenced code blocks with syntax highlighting.
 const renderMarkdown = (text) => {
   if (!text) return null;
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={{
+        a: ({ node: _node, ...props }) => (
+          <a {...props} target="_blank" rel="noopener noreferrer" />
+        ),
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+};
 
-  const lines = text.split('\n');
-  const elements = [];
-  let tableRows = [];
-  let listItems = [];
-
-  const flushList = (key) => {
-    if (listItems.length > 0) {
-      elements.push(<ul key={`list-${key}`}>{listItems}</ul>);
-      listItems = [];
-    }
-  };
-
-  const flushTable = (key) => {
-    if (tableRows.length > 0) {
-      // Check if first row is header and second is separator
-      const hasSeparator = tableRows.length > 1 && tableRows[1].every(cell => cell.trim().startsWith('-'));
-      const headerCells = tableRows[0];
-      const dataRows = hasSeparator ? tableRows.slice(2) : tableRows.slice(1);
-
-      elements.push(
-        <table key={`table-${key}`} className="markdown-table">
-          <thead>
-            <tr>
-              {headerCells.map((cell, idx) => (
-                <th key={`th-${idx}`}>{parseInline(cell)}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {dataRows.map((row, rowIdx) => (
-              <tr key={`tr-${rowIdx}`}>
-                {row.map((cell, cellIdx) => (
-                  <td key={`td-${cellIdx}`}>{parseInline(cell)}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      );
-      tableRows = [];
-    }
-  };
-
-  const parseInline = (str) => {
-    // Basic bold parser: **text** -> <strong>text</strong>
-    const parts = str.split(/\*\*([^*]+)\*\*/g);
-    return parts.map((part, idx) => {
-      if (idx % 2 === 1) {
-        return <strong key={idx}>{part}</strong>;
-      }
-      return part;
-    });
-  };
-
-  lines.forEach((line, index) => {
-    const trimmed = line.trim();
-
-    // Table Row detection (starts and ends with |)
-    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-      flushList(index);
-      const cells = trimmed.split('|').slice(1, -1);
-      tableRows.push(cells);
-      return;
-    } else {
-      flushTable(index);
-    }
-
-    // Bullet list detection
-    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-      listItems.push(<li key={`li-${index}`}>{parseInline(trimmed.substring(2))}</li>);
-      return;
-    } else {
-      flushList(index);
-    }
-
-    // Headers
-    if (trimmed.startsWith('### ')) {
-      elements.push(<h4 key={index}>{parseInline(trimmed.substring(4))}</h4>);
-    } else if (trimmed.startsWith('## ')) {
-      elements.push(<h3 key={index}>{parseInline(trimmed.substring(3))}</h3>);
-    } else if (trimmed.startsWith('# ')) {
-      elements.push(<h2 key={index}>{parseInline(trimmed.substring(2))}</h2>);
-    } else if (trimmed) {
-      elements.push(<p key={index}>{parseInline(trimmed)}</p>);
-    }
-  });
-
-  flushList(lines.length);
-  flushTable(lines.length);
-
-  return elements;
+const formatTimestamp = (ts) => {
+  if (!ts) return '';
+  const date = typeof ts === 'string' ? new Date(ts) : ts;
+  if (isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
 
 function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, setActiveChatId, fetchChats, resetKey }) {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
   const [isAiTyping, setIsAiTyping] = useState(false);
+  const [copiedId, setCopiedId] = useState(null);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+
+  const idCounterRef = useRef(0);
+  const makeId = () => `msg-${Date.now()}-${idCounterRef.current++}`;
+
+  const chatContentRef = useRef(null);
+  const bottomRef = useRef(null);
+  const autoScrollRef = useRef(true);
+
+  const handleCopy = (content, id) => {
+    navigator.clipboard.writeText(content).then(() => {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId((current) => (current === id ? null : current)), 1500);
+    }).catch(() => {});
+  };
+
+  const scrollToBottom = (behavior = 'auto') => {
+    bottomRef.current?.scrollIntoView({ behavior });
+    setShowScrollButton(false);
+    autoScrollRef.current = true;
+  };
+
+  const handleScroll = () => {
+    const el = chatContentRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom < 80;
+    autoScrollRef.current = nearBottom;
+    setShowScrollButton(!nearBottom);
+  };
+
+  // Auto-scroll on new messages / typing indicator, unless the user has
+  // scrolled up to read earlier content
+  useEffect(() => {
+    if (autoScrollRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+    }
+  }, [messages, isAiTyping]);
 
   React.useEffect(() => {
     if (activeChatId) {
       fetch(`http://127.0.0.1:8000/chat/${activeChatId}`)
         .then(res => res.json())
         .then(data => {
-          setMessages(data.messages || []);
+          setMessages((data.messages || []).map((m) => ({ ...m, id: makeId() })));
         })
         .catch(err => console.error("Error loading chat:", err));
     } else {
@@ -126,9 +98,10 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
     }
 
     const userMessage = inputValue;
-    setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    setMessages(prev => [...prev, { role: 'user', content: userMessage, timestamp: new Date().toISOString(), id: makeId() }]);
     setInputValue('');
     setIsAiTyping(true);
+    autoScrollRef.current = true;
 
     try {
       const formData = new FormData();
@@ -150,14 +123,20 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
       }
 
       const data = await response.json();
-      setMessages(prev => [...prev, { role: 'ai', content: data.response }]);
+      setMessages(prev => [...prev, {
+        role: 'ai',
+        content: data.response,
+        source_pages: data.source_pages,
+        timestamp: new Date().toISOString(),
+        id: makeId(),
+      }]);
 
       if (data.chat_id && !activeChatId) {
         setActiveChatId(data.chat_id);
         fetchChats();
       }
     } catch (error) {
-      setMessages(prev => [...prev, { role: 'ai', content: `Error: ${error.message}` }]);
+      setMessages(prev => [...prev, { role: 'ai', content: `Error: ${error.message}`, timestamp: new Date().toISOString(), id: makeId() }]);
     } finally {
       setIsAiTyping(false);
     }
@@ -167,7 +146,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   return (
     <div className="main-chat">
-      <div className="chat-content">
+      <div className="chat-content" ref={chatContentRef} onScroll={handleScroll}>
         {messages.length === 0 ? (
           <div className="empty-state">
             {!isUploading ? (
@@ -197,16 +176,34 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
             )}
           </div>
         ) : (
-          messages.map((msg, index) => (
-            <div key={index} className={`message-wrapper ${msg.role === 'user' ? 'user-align' : 'ai-align'}`}>
-              <div className={`message-bubble ${msg.role === 'user' ? 'user-bubble' : 'ai-bubble'}`}>
-                {msg.role === 'user' ? (
-                  <p>{msg.content}</p>
-                ) : (
-                  <div className="markdown-render">
-                    {renderMarkdown(msg.content)}
-                  </div>
-                )}
+          messages.map((msg) => (
+            <div key={msg.id} className={`message-wrapper ${msg.role === 'user' ? 'user-align' : 'ai-align'}`}>
+              <div className="message-group">
+                <div className={`message-bubble ${msg.role === 'user' ? 'user-bubble' : 'ai-bubble'}`}>
+                  {msg.role === 'user' ? (
+                    <p>{msg.content}</p>
+                  ) : (
+                    <>
+                      <button
+                        className="copy-btn"
+                        onClick={() => handleCopy(msg.content, msg.id)}
+                        title="Copy response"
+                        aria-label="Copy response"
+                      >
+                        {copiedId === msg.id ? '✓' : '⧉'}
+                      </button>
+                      <div className="markdown-render">
+                        {renderMarkdown(msg.content)}
+                      </div>
+                      {msg.source_pages && msg.source_pages.length > 0 && (
+                        <div className="source-footer">
+                          📄 Source{msg.source_pages.length > 1 ? 's' : ''}: {msg.source_pages.map(p => `Page ${p}`).join(', ')}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+                {msg.timestamp && <div className="message-timestamp">{formatTimestamp(msg.timestamp)}</div>}
               </div>
             </div>
           ))
@@ -220,7 +217,14 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
             </div>
           </div>
         )}
+        <div ref={bottomRef} />
       </div>
+
+      {showScrollButton && (
+        <button className="scroll-to-bottom-btn" onClick={() => scrollToBottom()}>
+          ↓ Scroll to bottom
+        </button>
+      )}
 
       <div className="chat-input-container">
         <div className="input-wrapper">

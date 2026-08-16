@@ -10,3 +10,4 @@ langchain-text-splitters
 fastembed
 langchain-community
 motor
+tavily-python

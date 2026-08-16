@@ -30,14 +30,20 @@ async def create_chat(device_id: str, initial_message: str):
     result = await chats_collection.insert_one(chat_doc)
     return str(result.inserted_id)
 
-async def add_message(chat_id: str, role: str, content: str):
+async def add_message(chat_id: str, role: str, content: str, tools_used=None, source_pages=None):
     if chats_collection is None:
         return
-    
+
+    message = {"role": role, "content": content, "timestamp": datetime.utcnow()}
+    if tools_used:
+        message["tools_used"] = tools_used
+    if source_pages:
+        message["source_pages"] = source_pages
+
     try:
         await chats_collection.update_one(
             {"_id": ObjectId(chat_id)},
-            {"$push": {"messages": {"role": role, "content": content, "timestamp": datetime.utcnow()}}}
+            {"$push": {"messages": message}}
         )
     except Exception as e:
         print(f"Error adding message to DB: {e}")

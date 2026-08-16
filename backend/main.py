@@ -143,19 +143,28 @@ async def chat(
     if not groq_api_key:
         raise HTTPException(status_code=400, detail="Groq API Key is required. Please set it in the environment or pass it.")
     
+    # Load prior conversation turns (before adding this message) so the model
+    # has continuity across the chat instead of treating every message in isolation
+    history = await database.get_chat_history(chat_id) if chat_id else []
+
     # Save user message
     if not chat_id:
         chat_id = await database.create_chat(device_id, message)
-    
+
     if chat_id:
         await database.add_message(chat_id, "user", message)
-    
-    response = query_rag(message, groq_api_key)
-    
+
+    result = query_rag(message, groq_api_key, history=history)
+
     if chat_id:
-        await database.add_message(chat_id, "ai", response)
-        
-    return {"response": response, "chat_id": chat_id}
+        await database.add_message(chat_id, "ai", result["answer"], result["tools_used"], result["source_pages"])
+
+    return {
+        "response": result["answer"],
+        "chat_id": chat_id,
+        "tools_used": result["tools_used"],
+        "source_pages": result["source_pages"],
+    }
 
 # --- Serve React Frontend ---
 frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
