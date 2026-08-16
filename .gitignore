@@ -9,3 +9,4 @@ frontend/dist/
 *.pyc
 chroma_db/
 uploaded_files/
+.claude/
