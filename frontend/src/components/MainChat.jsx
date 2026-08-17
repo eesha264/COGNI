@@ -1,10 +1,21 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import rehypeHighlight from 'rehype-highlight';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
 import 'highlight.js/styles/github-dark.css';
 import './MainChat.css';
+
+// AI responses sometimes contain literal HTML tags (e.g. <br> inside a table cell,
+// since markdown tables can't hold real line breaks). rehypeRaw parses that HTML;
+// rehypeSanitize then strips anything unsafe (scripts, event handlers, iframes)
+// before it's rendered, since this content comes from a model, not a trusted source.
+const sanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames || []), 'br'],
+};
 
 // Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
 // lists, blockquotes, links, and fenced code blocks with syntax highlighting.
@@ -13,10 +24,15 @@ const renderMarkdown = (text) => {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeHighlight]}
+      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], rehypeHighlight]}
       components={{
         a: ({ node: _node, ...props }) => (
           <a {...props} target="_blank" rel="noopener noreferrer" />
+        ),
+        table: ({ node: _node, ...props }) => (
+          <div className="table-scroll-wrapper">
+            <table {...props} />
+          </div>
         ),
       }}
     >

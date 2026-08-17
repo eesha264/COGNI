@@ -216,14 +216,17 @@
   color: var(--text-light-secondary);
 }
 
+.table-scroll-wrapper {
+  overflow-x: auto;
+  margin: 16px 0;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
 .markdown-render table {
   width: 100%;
   border-collapse: collapse;
-  margin: 16px 0;
   background-color: white;
-  border-radius: 8px;
-  overflow: hidden;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
 .markdown-render th,
