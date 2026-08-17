@@ -96,7 +96,16 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   const [showScrollButton, setShowScrollButton] = useState(false);
 
   const idCounterRef = useRef(0);
-  const makeId = () => `msg-${Date.now()}-${idCounterRef.current++}`;
+  // L3 fix: use crypto.randomUUID() (available in all modern browsers) for
+  // collision-safe IDs across tabs. Fall back to Date.now()+counter+random
+  // for older browsers. The old makeId used Date.now()+counter only, which
+  // could collide across browser tabs opened in the same millisecond.
+  const makeId = () => {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return `msg-${crypto.randomUUID()}`;
+    }
+    return `msg-${Date.now()}-${idCounterRef.current++}-${Math.random().toString(36).slice(2, 8)}`;
+  };
 
   const chatContentRef = useRef(null);
   const bottomRef = useRef(null);

@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from typing import List
 from contextlib import asynccontextmanager
 import os
 import shutil
@@ -51,7 +50,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 class ConnectionManager:
     def __init__(self):
         # device_id -> list of websockets for that device
-        self.connections_by_device: dict[str, List[WebSocket]] = {}
+        self.connections_by_device: dict[str, list[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, device_id: str):
         await websocket.accept()

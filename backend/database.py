@@ -1,8 +1,12 @@
 import os
+import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import datetime, timezone
+
+# L2 fix: use logging instead of print() for warnings/errors
+logger = logging.getLogger("cogni.database")
 
 client = None
 db = None
@@ -22,7 +26,7 @@ def connect_db():
     global client, db, chats_collection
     mongodb_uri = os.getenv("MONGODB_URI")
     if not mongodb_uri:
-        print("Warning: MONGODB_URI not found in environment. Chat history won't be saved.")
+        logger.warning("MONGODB_URI not found in environment. Chat history won't be saved.")
         return
     client = AsyncIOMotorClient(mongodb_uri)
     db = client.cogni_db
@@ -86,7 +90,7 @@ async def add_message(chat_id: str, role: str, content: str, tools_used=None, so
             {"$push": {"messages": message}}
         )
     except Exception as e:
-        print(f"Error adding message to DB: {e}")
+        logger.error(f"Error adding message to DB: {e}")
 
 async def get_chats(device_id: str):
     if chats_collection is None:
@@ -143,5 +147,5 @@ async def delete_chat(chat_id: str, device_id: str = None):
         result = await chats_collection.delete_one(query)
         return result.deleted_count > 0
     except Exception as e:
-        print(f"Error deleting chat: {e}")
+        logger.error(f"Error deleting chat: {e}")
         return False

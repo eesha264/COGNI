@@ -1,4 +1,5 @@
 backend/venv/
+backend/.venv/
 backend/__pycache__/
 backend/chroma_db/
 backend/uploaded_files/
@@ -10,3 +11,11 @@ frontend/dist/
 chroma_db/
 uploaded_files/
 .claude/
+# L4 fix: add common dev artifacts
+.venv/
+.idea/
+.vscode/
+*.log
+*.egg-info/
+.pytest_cache/
+.env.local
