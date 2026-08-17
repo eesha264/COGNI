@@ -16,12 +16,48 @@ from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 # FastEmbed is lightweight and runs locally without needing an API key for embeddings
 embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-# Initialize Vector Store
-vector_store = Chroma(
-    collection_name="pdf_docs",
-    embedding_function=embeddings,
-    persist_directory="./chroma_db"
-)
+CHROMA_PERSIST_DIR = "./chroma_db"
+
+# C8 fix: per-document collections instead of a single global vector_store.
+# Previously process_pdf wiped the whole collection on every upload, so only
+# the most recent PDF was queryable. Now each upload gets its own collection
+# keyed by a document_id, and query_rag looks up the right collection per chat.
+# A module-level cache keeps Chroma clients cheap to reuse.
+_vector_store_cache: dict[str, Chroma] = {}
+import threading
+_vector_store_lock = threading.Lock()
+
+
+def get_vector_store(collection_name: str) -> Chroma:
+    """Return (and cache) a Chroma store for the given per-document collection."""
+    with _vector_store_lock:
+        vs = _vector_store_cache.get(collection_name)
+        if vs is None:
+            vs = Chroma(
+                collection_name=collection_name,
+                embedding_function=embeddings,
+                persist_directory=CHROMA_PERSIST_DIR,
+            )
+            _vector_store_cache[collection_name] = vs
+        return vs
+
+
+def delete_vector_store(collection_name: str) -> None:
+    """Delete a per-document collection if it exists, and drop it from the cache."""
+    with _vector_store_lock:
+        vs = _vector_store_cache.pop(collection_name, None)
+        if vs is None:
+            vs = Chroma(
+                collection_name=collection_name,
+                embedding_function=embeddings,
+                persist_directory=CHROMA_PERSIST_DIR,
+            )
+        try:
+            vs.delete_collection()
+        except Exception:
+            # Collection didn't exist — nothing to delete.
+            pass
+
 
 import time
 
@@ -101,7 +137,10 @@ _TOOLS_BY_NAME = {t.name: t for t in AVAILABLE_TOOLS}
 # text is treated as scanned/handwritten/image-only, and routed to vision instead.
 MIN_TEXT_CHARS = 20
 
-VISION_MODEL = "qwen/qwen3.6-27b"  # Groq's current vision-capable model
+# C6 fix: use a real Groq vision-capable model. "qwen/qwen3.6-27b" does not
+# exist on Groq and always failed at runtime. Llama 4 Scout is Groq's current
+# multimodal model. Allow override via env var for future model swaps.
+VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 
 def _extract_text_via_vision(page: "pymupdf.Page", groq_api_key: str) -> str:
@@ -126,94 +165,99 @@ def _extract_text_via_vision(page: "pymupdf.Page", groq_api_key: str) -> str:
         return f"[Vision extraction failed for this page: {e}]"
 
 
-def process_pdf(file_path: str, callback=None):
+def process_pdf(file_path: str, callback=None, groq_api_key: str = None, document_id: str = None):
     """
     Extracts text, tables, and image metadata from a PDF up to 400 pages.
+    C8 fix: indexes into a per-document collection (named by document_id) so
+    uploading a new PDF no longer wipes the previous one.
     """
-    global vector_store
     if callback:
         callback("Analyzing the pdf")
     time.sleep(1)
 
+    # C12 fix: use try/finally so the file handle is always closed, even on
+    # early returns (e.g. >400 pages) or exceptions.
     doc = pymupdf.open(file_path)
+    try:
+        # Check page limit
+        if len(doc) > 400:
+            return {"error": "PDF exceeds 400 pages limit."}
 
-    # Check page limit
-    if len(doc) > 400:
-        return {"error": "PDF exceeds 400 pages limit."}
+        if callback:
+            callback("Analyze images")
+        time.sleep(1)
 
-    if callback:
-        callback("Analyze images")
-    time.sleep(1)
+        # C7 fix: prefer the caller-provided key (from the browser) over the env var
+        # so vision OCR works even when the server admin hasn't set GROQ_API_KEY.
+        if not groq_api_key:
+            groq_api_key = os.getenv("GROQ_API_KEY")
 
-    groq_api_key = os.getenv("GROQ_API_KEY")
+        # Chunk each page separately (rather than joining all pages into one blob
+        # first) so every chunk can be tagged with its source page number — this is
+        # what lets query_rag report which pages an answer actually came from.
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
 
-    # Chunk each page separately (rather than joining all pages into one blob
-    # first) so every chunk can be tagged with its source page number — this is
-    # what lets query_rag report which pages an answer actually came from.
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
+        all_chunks = []
+        all_metadatas = []
 
-    all_chunks = []
-    all_metadatas = []
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
 
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
+            # Extract embedded digital text (fast, free — works for typed PDFs)
+            text = page.get_text("text")
 
-        # Extract embedded digital text (fast, free — works for typed PDFs)
-        text = page.get_text("text")
+            # If almost no digital text was found, this page is likely scanned or
+            # handwritten — fall back to a Groq vision model to read it from an image
+            if len(text.strip()) < MIN_TEXT_CHARS:
+                if groq_api_key:
+                    text = _extract_text_via_vision(page, groq_api_key) or text
+                else:
+                    text += "\n[Note: this page appears to be scanned/handwritten but could not be analyzed — GROQ_API_KEY not configured]"
 
-        # If almost no digital text was found, this page is likely scanned or
-        # handwritten — fall back to a Groq vision model to read it from an image
-        if len(text.strip()) < MIN_TEXT_CHARS:
-            if groq_api_key:
-                text = _extract_text_via_vision(page, groq_api_key) or text
-            else:
-                text += "\n[Note: this page appears to be scanned/handwritten but could not be analyzed — GROQ_API_KEY not configured]"
+            # Extract structured tables locally (free, no AI) for typed pages
+            table_markdown = ""
+            try:
+                found = page.find_tables()
+                if found.tables:
+                    table_markdown = "\n\n".join(t.to_markdown() for t in found.tables)
+            except Exception:
+                pass
 
-        # Extract structured tables locally (free, no AI) for typed pages
-        table_markdown = ""
-        try:
-            found = page.find_tables()
-            if found.tables:
-                table_markdown = "\n\n".join(t.to_markdown() for t in found.tables)
-        except Exception:
-            pass
+            # Get image metadata
+            images = page.get_images()
+            image_info = f"\n[Page {page_num+1} contains {len(images)} images]\n" if images else ""
 
-        # Get image metadata
-        images = page.get_images()
-        image_info = f"\n[Page {page_num+1} contains {len(images)} images]\n" if images else ""
+            page_content = f"--- Page {page_num+1} ---\n{text}\n{image_info}"
+            if table_markdown:
+                page_content += f"\n[Tables detected on page {page_num+1}]\n{table_markdown}\n"
 
-        page_content = f"--- Page {page_num+1} ---\n{text}\n{image_info}"
-        if table_markdown:
-            page_content += f"\n[Tables detected on page {page_num+1}]\n{table_markdown}\n"
+            page_chunks = text_splitter.split_text(page_content)
+            all_chunks.extend(page_chunks)
+            all_metadatas.extend([{"page": page_num + 1}] * len(page_chunks))
 
-        page_chunks = text_splitter.split_text(page_content)
-        all_chunks.extend(page_chunks)
-        all_metadatas.extend([{"page": page_num + 1}] * len(page_chunks))
+        if callback:
+            callback("Analyze tables")
+        time.sleep(1)
 
-    if callback:
-        callback("Analyze tables")
-    time.sleep(1)
+        if callback:
+            callback("Convert to text")
+        time.sleep(1)
 
-    if callback:
-        callback("Convert to text")
-    time.sleep(1)
+    finally:
+        doc.close()
 
-    doc.close()
-
-    # Clear the old vector store collection for a new document upload
-    vector_store.delete_collection()
-    vector_store = Chroma(
-        collection_name="pdf_docs",
-        embedding_function=embeddings,
-        persist_directory="./chroma_db"
-    )
+    # C8 fix: index into a per-document collection instead of wiping a global one.
+    collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
+    # Replace any previous collection for this document_id (re-upload of same doc)
+    delete_vector_store(collection_name)
+    vs = get_vector_store(collection_name)
 
     # Add new chunks, tagged with their source page
-    vector_store.add_texts(all_chunks, metadatas=all_metadatas)
+    vs.add_texts(all_chunks, metadatas=all_metadatas)
 
     if callback:
         callback("Create embeddings")
@@ -226,20 +270,25 @@ def process_pdf(file_path: str, callback=None):
     if callback:
         callback("Done")
 
-    return {"status": "success", "chunks_processed": len(all_chunks)}
+    return {"status": "success", "chunks_processed": len(all_chunks), "document_id": document_id}
 
 
 MAX_HISTORY_MESSAGES = 20  # most recent messages (~10 turns) kept for conversational context
 
 
-def query_rag(question: str, groq_api_key: str, history=None):
+def query_rag(question: str, groq_api_key: str, history=None, document_id: str = None):
     """
     Queries the vector store and returns a response from Groq using the strict system prompt,
     conditioned on the prior conversation (if any) so follow-up questions have continuity.
     Returns a dict: {"answer": str, "tools_used": [str], "source_pages": [int]}.
+    C8 fix: queries the per-document collection identified by document_id.
     """
     if not groq_api_key:
         return {"answer": "Error: Groq API key is missing. Please add it to your environment.", "tools_used": [], "source_pages": []}
+
+    # C8 fix: use the per-document collection instead of the global vector_store.
+    collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
+    vs = get_vector_store(collection_name)
 
     # Pages actually consulted this turn — populated only when search_document is
     # called, so the "Source: Page X" shown to the user is precise by construction
@@ -254,7 +303,7 @@ def query_rag(question: str, groq_api_key: str, history=None):
         assume you already know its contents, and never guess at what it says
         without searching first. Returns the most relevant excerpts, each labeled
         with its page number."""
-        results = vector_store.similarity_search(query, k=4)
+        results = vs.similarity_search(query, k=4)
         if not results:
             return "No document has been uploaded yet, or the document index is empty."
         parts = []
@@ -275,7 +324,7 @@ def query_rag(question: str, groq_api_key: str, history=None):
 5. USE CONVERSATION HISTORY: Prior messages in this conversation (if any) are included below. Use them to understand follow-up questions, pronouns ("it", "that"), and context the user already established — don't treat every message as a brand-new, unrelated conversation.
 6. TONE: Be conversational, polite, and helpful — like a careful research partner who is upfront about the limits of what they actually know.
 7. FORMATTING: Use natural paragraphs and clear Markdown formatting (headers, bullet points, bold text) to make your response easy to read. Do NOT use Markdown tables unless the user explicitly requests one, or you are directly extracting a table from the document.
-8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\[...\]` or `\(...\)` delimiters."""
+8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\\\\[...\\\\]` or `\\\\(...\\\\)` delimiters."""
 
     # Determine model to use (allow override via env var)
     model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")

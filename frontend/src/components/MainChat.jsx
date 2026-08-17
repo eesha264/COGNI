@@ -30,13 +30,29 @@ const sanitizeSchema = {
 // remark-math only recognizes $...$ / $$...$$ delimiters, but models frequently
 // write \(...\) / \[...\] instead regardless of prompt instructions — convert
 // those to the delimiters remark-math understands before rendering.
+// C16 fix: skip fenced code blocks (```...```) and inline code spans (`...`)
+// so that source code containing \[ \] \( \) (regex, shell, LaTeX source) is
+// not mangled into math delimiters.
 const normalizeLatexDelimiters = (text) => {
   if (!text) return text;
-  return text
-    .replace(/\\\[/g, () => '$$')
-    .replace(/\\\]/g, () => '$$')
-    .replace(/\\\(/g, () => '$')
-    .replace(/\\\)/g, () => '$');
+
+  // Split on fenced code blocks (```...```), preserving the delimiters.
+  const fenceSplit = text.split(/(```[\s\S]*?```)/g);
+  return fenceSplit.map((segment, i) => {
+    // Odd indices (by the capture group) are fenced code blocks — leave them.
+    if (i % 2 === 1) return segment;
+
+    // For the non-code segments, also protect inline code spans (`...`).
+    const inlineSplit = segment.split(/(`[^`]*`)/g);
+    return inlineSplit.map((seg, j) => {
+      if (j % 2 === 1) return seg; // inline code — leave it
+      return seg
+        .replace(/\\\[/g, () => '$$')
+        .replace(/\\\]/g, () => '$$')
+        .replace(/\\\(/g, () => '$')
+        .replace(/\\\)/g, () => '$');
+    }).join('');
+  }).join('');
 };
 
 // Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
@@ -118,7 +134,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`http://127.0.0.1:8000/chat/${activeChatId}`)
+      fetch(`http://127.0.0.1:8000/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
         .then(res => res.json())
         .then(data => {
           setMessages((data.messages || []).map((m) => ({ ...m, id: makeId() })));
@@ -127,7 +143,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
     } else {
       setMessages([]);
     }
-  }, [activeChatId, resetKey]);
+  }, [activeChatId, resetKey, deviceId]);
 
   const handleSend = async () => {
     if (!inputValue.trim() || isAiTyping) return;

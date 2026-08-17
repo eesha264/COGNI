@@ -5,7 +5,11 @@ import RightSidebar from './components/RightSidebar';
 import SettingsModal from './components/SettingsModal';
 
 function App() {
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
+  // C15 fix: store the Groq API key in sessionStorage (cleared when the tab
+  // closes) instead of localStorage so it doesn't persist forever and isn't
+  // readable by other tabs/origins. device_id stays in localStorage because
+  // chat history must persist across sessions.
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem("groq_api_key") || "");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeStep, setActiveStep] = useState("");
   const [isUploading, setIsUploading] = useState(false);
@@ -23,7 +27,7 @@ function App() {
   const wsRef = useRef(null);
 
   const handleSaveApiKey = (key) => {
-    localStorage.setItem("groq_api_key", key);
+    sessionStorage.setItem("groq_api_key", key);
     setApiKey(key);
   };
 
@@ -36,8 +40,8 @@ function App() {
       wsRef.current.close();
     }
 
-    // Connect to backend websocket
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws/process");
+    // Connect to backend websocket (C4 fix: send device_id for scoped broadcasts)
+    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/process?device_id=${encodeURIComponent(deviceId)}`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
@@ -90,7 +94,7 @@ function App() {
 
   const handleDeleteChat = async (chatId) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8000/chat/${chatId}`, {
+      const response = await fetch(`http://127.0.0.1:8000/chat/${chatId}?device_id=${encodeURIComponent(deviceId)}`, {
         method: "DELETE"
       });
 
@@ -109,7 +113,7 @@ function App() {
 
   const handleFileUpload = async (file) => {
     if (!file) return;
-    if (!file.name.endsWith('.pdf')) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
       alert("Please select a PDF file.");
       return;
     }
@@ -120,6 +124,10 @@ function App() {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("device_id", deviceId);
+    // C7 fix: send the user's Groq API key so vision OCR works on scanned PDFs
+    if (apiKey) {
+      formData.append("api_key", apiKey);
+    }
 
     try {
       const response = await fetch("http://127.0.0.1:8000/upload", {

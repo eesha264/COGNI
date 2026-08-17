@@ -13,7 +13,7 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
 
   const handleLogout = () => {
     localStorage.removeItem("device_id");
-    localStorage.removeItem("groq_api_key");
+    sessionStorage.removeItem("groq_api_key");
     window.location.reload();
   };
 
@@ -34,7 +34,7 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
               value={tempKey} 
               onChange={(e) => setTempKey(e.target.value)} 
             />
-            <p className="help-text">Your API key is saved locally in your browser and never sent anywhere else except directly to the backend server to communicate with Groq.</p>
+            <p className="help-text">Your API key is saved in this browser tab's session only (cleared when you close the tab) and is sent only to the backend server to communicate with Groq.</p>
           </div>
         </div>
         <div className="modal-footer" style={{justifyContent: 'space-between'}}>

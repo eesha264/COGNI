@@ -137,7 +137,7 @@ pip install -r requirements.txt
 
 Create a `.env` file in the `backend/` directory and add your MongoDB URL:
 ```env
-MONGODB_URL=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/?appName=COGNI
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/?appName=COGNI
 ```
 
 Start the backend server:
