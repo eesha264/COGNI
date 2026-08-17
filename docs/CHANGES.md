@@ -2,7 +2,8 @@
 
 This document summarizes the changes made to Cogni in this working session: adding
 tool calling, fixing hallucination and conversation-memory issues, adding
-handwriting/table analysis, and several chat UI improvements.
+handwriting/table analysis, several chat UI improvements, and fixing raw-HTML/table
+overflow and math-rendering bugs found via live testing.
 
 ## Backend
 
@@ -104,6 +105,38 @@ would have been a purely client-side reveal animation.)
 Message avatars (✨ for AI, 🙂 for user) were added and then removed at the user's
 request.
 
+### 11. Literal `<br>` text and table overflow
+Two bugs found via live testing on a real saved conversation:
+- The model sometimes writes literal HTML `<br>` tags inside table cells (a common way
+  to force a line break within a single markdown table cell, since markdown table rows
+  can't contain real newlines). `react-markdown` doesn't interpret raw HTML by default
+  (a safety default), so it printed the tag as visible text instead of a line break.
+  **Fix:** added `rehype-raw` (parses the HTML) + `rehype-sanitize` (strips anything
+  unsafe — scripts, event handlers, iframes — since this is model-generated content,
+  not a trusted source) so `<br>` renders as a real line break without opening up
+  arbitrary HTML injection.
+- Tables had no overflow handling — a wide table would spill past the edge of the chat
+  bubble instead of scrolling. **Fix:** tables now render inside a
+  `.table-scroll-wrapper` with `overflow-x: auto`.
+
+### 12. Math rendering (LaTeX/KaTeX)
+The model would answer math questions (e.g. integrals) using LaTeX notation, but with
+no math renderer in the pipeline it showed up as raw text with brackets and
+backslashes. Investigating showed two stacked problems: (1) no math-rendering plugin
+existed at all, and (2) plain Markdown's own backslash-escape rule was silently eating
+backslashes that sat in front of punctuation (e.g. `\,` → `,`, `\[` → `[`), corrupting
+the LaTeX source itself, while backslashes before letters (`\int`, `\frac`) survived —
+which is why the raw output looked inconsistently mangled.
+
+**Fix:** added `remark-math` + `rehype-katex` (+ KaTeX's CSS) to properly typeset math.
+The system prompt was updated to ask the model to use `$...$` / `$$...$$` delimiters
+(what `remark-math` recognizes), but the model kept using `\(...\)` / `\[...\]`
+regardless of the instruction — a common LLM habit. Rather than rely on prompt
+compliance, added a client-side `normalizeLatexDelimiters()` step in `MainChat.jsx`
+that converts bracket-style delimiters to dollar-style before rendering, which also
+resolves the backslash-eating problem as a side effect (once content is inside a
+recognized math span, generic Markdown escaping no longer applies to it).
+
 ## Verification
 
 No formal test suite exists in this project (no pytest, no jest/vitest). Verification
@@ -119,5 +152,11 @@ performed before merging:
   5. Multi-turn conversation memory (a fact stated in one message is correctly recalled
      in a later message in the same chat)
   6. OCR/vision extraction and table structure on a synthetic scanned page
+- The `<br>`/table-overflow and math-rendering fixes were additionally verified live in
+  the browser against real saved conversations that reproduced each bug (not just a
+  syntax/build check): confirmed `<br>` renders as an actual line break with no
+  regression to the table wrapper, and confirmed a real integral question renders with
+  proper mathematical typesetting (integral signs, fractions, exponents) instead of raw
+  LaTeX text.
 
 All checks passed.

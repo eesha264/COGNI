@@ -1,30 +1,54 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import rehypeKatex from 'rehype-katex';
 import rehypeHighlight from 'rehype-highlight';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
 import 'highlight.js/styles/github-dark.css';
+import 'katex/dist/katex.min.css';
 import './MainChat.css';
 
 // AI responses sometimes contain literal HTML tags (e.g. <br> inside a table cell,
 // since markdown tables can't hold real line breaks). rehypeRaw parses that HTML;
 // rehypeSanitize then strips anything unsafe (scripts, event handlers, iframes)
 // before it's rendered, since this content comes from a model, not a trusted source.
+// The math/math-inline/math-display classes are remark-math's markers for content
+// rehypeKatex still needs to find and render after sanitizing.
 const sanitizeSchema = {
   ...defaultSchema,
   tagNames: [...(defaultSchema.tagNames || []), 'br'],
+  attributes: {
+    ...defaultSchema.attributes,
+    div: [...(defaultSchema.attributes?.div || []), 'className'],
+    span: [...(defaultSchema.attributes?.span || []), 'className'],
+  },
+};
+
+// remark-math only recognizes $...$ / $$...$$ delimiters, but models frequently
+// write \(...\) / \[...\] instead regardless of prompt instructions — convert
+// those to the delimiters remark-math understands before rendering.
+const normalizeLatexDelimiters = (text) => {
+  if (!text) return text;
+  return text
+    .replace(/\\\[/g, () => '$$')
+    .replace(/\\\]/g, () => '$$')
+    .replace(/\\\(/g, () => '$')
+    .replace(/\\\)/g, () => '$');
 };
 
 // Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
-// lists, blockquotes, links, and fenced code blocks with syntax highlighting.
+// lists, blockquotes, links, fenced code blocks with syntax highlighting, and
+// LaTeX math ($...$ inline, $$...$$ block) typeset via KaTeX.
 const renderMarkdown = (text) => {
   if (!text) return null;
+  const normalized = normalizeLatexDelimiters(text);
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], rehypeHighlight]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], rehypeKatex, rehypeHighlight]}
       components={{
         a: ({ node: _node, ...props }) => (
           <a {...props} target="_blank" rel="noopener noreferrer" />
@@ -36,7 +60,7 @@ const renderMarkdown = (text) => {
         ),
       }}
     >
-      {text}
+      {normalized}
     </ReactMarkdown>
   );
 };

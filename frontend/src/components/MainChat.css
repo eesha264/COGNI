@@ -241,6 +241,13 @@
   font-weight: 600;
 }
 
+/* Block math ($$...$$) can render wider than the bubble — scroll instead of overflow */
+.markdown-render .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+
 /* Inline code (not inside a fenced code block) */
 .markdown-render :not(pre) > code {
   background-color: rgba(0, 0, 0, 0.06);
