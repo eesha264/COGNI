@@ -1,15 +1,10 @@
 import React, { useRef } from 'react';
+import { STEP_ORDER } from '../constants';
 import './RightSidebar.css';
 
-const BACKEND = [
-  'Analyzing the pdf',   // 0
-  'Analyze images',      // 1
-  'Analyze tables',      // 2
-  'Convert to text',     // 3
-  'Create embeddings',   // 4
-  'Save to Vector DB',   // 5
-  'Done',                // 6
-];
+// M17 fix: use shared STEP_ORDER from constants.js instead of duplicating
+// magic strings that could drift from the backend's callback labels.
+const BACKEND = STEP_ORDER;
 
 function getStatus(idx, activeIndex, isDone) {
   if (isDone) return 'completed';

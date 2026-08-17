@@ -4,6 +4,11 @@ import MainChat from './components/MainChat';
 import RightSidebar from './components/RightSidebar';
 import SettingsModal from './components/SettingsModal';
 
+// M3 fix: centralize the backend URL so it's configurable via env var instead
+// of being hardcoded in 6+ places. Vite exposes import.meta.env.VITE_API_URL.
+const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const WS_URL = import.meta.env.VITE_WS_URL || API_URL.replace(/^http/, 'ws');
+
 function App() {
   // C15 fix: store the Groq API key in sessionStorage (cleared when the tab
   // closes) instead of localStorage so it doesn't persist forever and isn't
@@ -16,7 +21,9 @@ function App() {
   const [deviceId] = useState(() => {
     let id = localStorage.getItem("device_id");
     if (!id) {
-      id = "device-" + Math.random().toString(36).substr(2, 9);
+      // M2 fix: use crypto.randomUUID (128-bit, collision-safe) instead of
+      // Math.random().toString(36).substr(2,9) (~46 bits, substr deprecated).
+      id = "device-" + (crypto.randomUUID?.() || Math.random().toString(36).slice(2, 11));
       localStorage.setItem("device_id", id);
     }
     return id;
@@ -31,6 +38,15 @@ function App() {
     setApiKey(key);
   };
 
+  // M9 fix: in-app logout without page reload — clears state and starts fresh
+  const handleLogout = () => {
+    setApiKey("");
+    setActiveChatId(null);
+    setActiveStep("");
+    setChats([]);
+    setResetKey(prev => prev + 1);
+  };
+
   const startWebSocket = () => {
     // Reset active step
     setActiveStep("Analyzing the pdf");
@@ -41,7 +57,7 @@ function App() {
     }
 
     // Connect to backend websocket (C4 fix: send device_id for scoped broadcasts)
-    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/process?device_id=${encodeURIComponent(deviceId)}`);
+    const ws = new WebSocket(`${WS_URL}/ws/process?device_id=${encodeURIComponent(deviceId)}`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
@@ -72,7 +88,7 @@ function App() {
 
   const fetchChats = React.useCallback(async () => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/chats/${deviceId}`);
+      const res = await fetch(`${API_URL}/chats/${deviceId}`);
       if (res.ok) {
         const data = await res.json();
         setChats(data.chats || []);
@@ -94,7 +110,7 @@ function App() {
 
   const handleDeleteChat = async (chatId) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8000/chat/${chatId}?device_id=${encodeURIComponent(deviceId)}`, {
+      const response = await fetch(`${API_URL}/chat/${chatId}?device_id=${encodeURIComponent(deviceId)}`, {
         method: "DELETE"
       });
 
@@ -130,7 +146,7 @@ function App() {
     }
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/upload", {
+      const response = await fetch(`${API_URL}/upload`, {
         method: "POST",
         body: formData,
       });
@@ -192,9 +208,12 @@ function App() {
         onClose={() => setIsSettingsOpen(false)}
         apiKey={apiKey}
         onSaveApiKey={handleSaveApiKey}
+        onLogout={handleLogout}
       />
     </div>
   );
 }
 
 export default App;
+
+

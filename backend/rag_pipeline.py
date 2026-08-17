@@ -2,6 +2,8 @@ import os
 import ast
 import base64
 import operator
+import time
+import threading
 from datetime import datetime
 import pymupdf  # fitz
 from tavily import TavilyClient
@@ -12,9 +14,22 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 
-# Initialize the Embeddings
-# FastEmbed is lightweight and runs locally without needing an API key for embeddings
-embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+# M13 fix: lazy-init embeddings so import time is fast and we can reconfigure.
+# Previously FastEmbedEmbeddings was initialized at import time, which:
+#  1. Downloads/loads the ONNX model on every server start (slow)
+#  2. Fails the entire import if the model dir is locked
+#  3. Prevents changing the model name at runtime
+_embeddings = None
+_embeddings_lock = threading.Lock()
+
+def get_embeddings():
+    """Lazily initialize and cache the FastEmbed embeddings instance."""
+    global _embeddings
+    if _embeddings is None:
+        with _embeddings_lock:
+            if _embeddings is None:
+                _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    return _embeddings
 
 CHROMA_PERSIST_DIR = "./chroma_db"
 
@@ -24,7 +39,6 @@ CHROMA_PERSIST_DIR = "./chroma_db"
 # keyed by a document_id, and query_rag looks up the right collection per chat.
 # A module-level cache keeps Chroma clients cheap to reuse.
 _vector_store_cache: dict[str, Chroma] = {}
-import threading
 _vector_store_lock = threading.Lock()
 
 
@@ -35,7 +49,7 @@ def get_vector_store(collection_name: str) -> Chroma:
         if vs is None:
             vs = Chroma(
                 collection_name=collection_name,
-                embedding_function=embeddings,
+                embedding_function=get_embeddings(),
                 persist_directory=CHROMA_PERSIST_DIR,
             )
             _vector_store_cache[collection_name] = vs
@@ -49,7 +63,7 @@ def delete_vector_store(collection_name: str) -> None:
         if vs is None:
             vs = Chroma(
                 collection_name=collection_name,
-                embedding_function=embeddings,
+                embedding_function=get_embeddings(),
                 persist_directory=CHROMA_PERSIST_DIR,
             )
         try:
@@ -58,8 +72,6 @@ def delete_vector_store(collection_name: str) -> None:
             # Collection didn't exist — nothing to delete.
             pass
 
-
-import time
 
 # --- Tools available to the LLM (bound in query_rag via bind_tools) ---
 
@@ -109,11 +121,25 @@ def get_current_datetime() -> str:
     return now.strftime("%A, %B %d, %Y at %I:%M %p (server local time)")
 
 
+# M20 fix: simple in-memory cache for web_search to avoid burning Tavily quota
+# on repeated queries within the same conversation.
+_web_search_cache: dict[str, str] = {}
+_web_search_cache_lock = threading.Lock()
+WEB_SEARCH_CACHE_TTL = 300  # 5 minutes
+
+
 @tool
 def web_search(query: str) -> str:
     """Search the live web for information not in the uploaded document and not reliably
     known from memory — current events, weather, prices, or any fact that could have
     changed since training. Use this instead of guessing whenever precision matters."""
+    # M20 fix: check cache first
+    cache_key = query.lower().strip()
+    with _web_search_cache_lock:
+        cached = _web_search_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
         return "Error: web search is not configured (missing TAVILY_API_KEY)."
@@ -121,11 +147,17 @@ def web_search(query: str) -> str:
         client = TavilyClient(api_key=api_key)
         response = client.search(query, max_results=3, include_answer=True)
         if response.get("answer"):
-            return response["answer"]
-        results = response.get("results", [])
-        if not results:
-            return "No web results found for that query."
-        return "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+            result = response["answer"]
+        else:
+            results = response.get("results", [])
+            if not results:
+                result = "No web results found for that query."
+            else:
+                result = "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+        # M20 fix: cache the result
+        with _web_search_cache_lock:
+            _web_search_cache[cache_key] = result
+        return result
     except Exception as e:
         return f"Error performing web search: {e}"
 
@@ -173,7 +205,7 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
     """
     if callback:
         callback("Analyzing the pdf")
-    time.sleep(1)
+
 
     # C12 fix: use try/finally so the file handle is always closed, even on
     # early returns (e.g. >400 pages) or exceptions.
@@ -185,7 +217,7 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
         if callback:
             callback("Analyze images")
-        time.sleep(1)
+    
 
         # C7 fix: prefer the caller-provided key (from the browser) over the env var
         # so vision OCR works even when the server admin hasn't set GROQ_API_KEY.
@@ -247,11 +279,11 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
         if callback:
             callback("Analyze tables")
-        time.sleep(1)
+    
 
         if callback:
             callback("Convert to text")
-        time.sleep(1)
+    
 
     finally:
         doc.close()
@@ -267,11 +299,11 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
     if callback:
         callback("Create embeddings")
-    time.sleep(1)
+
 
     if callback:
         callback("Save to Vector DB")
-    time.sleep(1)
+
 
     if callback:
         callback("Done")
@@ -438,3 +470,4 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         else:
             answer = f"Error communicating with LLM: {err_str}"
         return {"answer": answer, "tools_used": tools_used, "source_pages": []}
+

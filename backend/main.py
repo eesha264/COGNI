@@ -199,9 +199,10 @@ async def upload_pdf(
     }
 
 @app.get("/chats/{device_id}")
-async def get_recent_chats(device_id: str):
-    chats = await database.get_chats(device_id)
-    return {"chats": chats}
+async def get_recent_chats(device_id: str, page: int = 1, per_page: int = 50):
+    # M14 fix: pass pagination params to get_chats
+    result = await database.get_chats(device_id, page=page, per_page=per_page)
+    return result
 
 @app.get("/chat/{chat_id}")
 async def get_chat_history(chat_id: str, device_id: str = None):
@@ -272,20 +273,31 @@ async def chat(
     return response
 
 # --- Serve React Frontend ---
+# M15 fix: check for dist/ at request time instead of import time, so building
+# the frontend after starting the server still works without a restart.
 frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
 
-if os.path.exists(frontend_dist):
-    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+@app.get("/")
+async def serve_react_app_root():
+    index_path = os.path.join(frontend_dist, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="Frontend not built. Run 'npm run build' in frontend/.")
 
-    @app.get("/")
-    async def serve_react_app_root():
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+@app.get("/{catchall:path}")
+async def serve_react_app(catchall: str):
+    # H8 fix: explicitly exclude API paths so a new API route registered
+    # after this catchall doesn't get silently swallowed. Return 404 for
+    # known API prefixes instead of serving index.html.
+    if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
+        raise HTTPException(status_code=404, detail="Not found")
 
-    @app.get("/{catchall:path}")
-    async def serve_react_app(catchall: str):
-        # H8 fix: explicitly exclude API paths so a new API route registered
-        # after this catchall doesn't get silently swallowed. Return 404 for
-        # known API prefixes instead of serving index.html.
-        if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
-            raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+    # M15 fix: check for dist/ at request time
+    file_path = os.path.join(frontend_dist, catchall)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path)
+
+    index_path = os.path.join(frontend_dist, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="Frontend not built. Run 'npm run build' in frontend/.")

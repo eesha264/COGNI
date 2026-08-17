@@ -2,13 +2,18 @@ import React from 'react';
 import './LeftSidebar.css';
 
 function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectChat, onDeleteChat }) {
+  // M8 fix: wire up the collapse button to toggle sidebar visibility
+  const [collapsed, setCollapsed] = React.useState(false);
+
   return (
-    <div className="left-sidebar">
+    <div className={`left-sidebar ${collapsed ? 'collapsed' : ''}`}>
       <div className="sidebar-header">
         <div className="logo">
           <span className="logo-text">COGNI</span>
         </div>
-        <button className="collapse-btn">◫</button>
+        <button className="collapse-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? "Expand" : "Collapse"}>
+          {collapsed ? '▶' : '◫'}
+        </button>
       </div>
 
       <nav className="sidebar-nav">

@@ -1,4 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+// M3 fix: use centralized API_URL instead of hardcoded 127.0.0.1:8000
+const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -17,13 +19,15 @@ import './MainChat.css';
 // before it's rendered, since this content comes from a model, not a trusted source.
 // The math/math-inline/math-display classes are remark-math's markers for content
 // rehypeKatex still needs to find and render after sanitizing.
+// M4 fix: restrict className to only KaTeX/math class names instead of allowing
+// any arbitrary class (which could be used for CSS-based attacks).
 const sanitizeSchema = {
   ...defaultSchema,
   tagNames: [...(defaultSchema.tagNames || []), 'br'],
   attributes: {
     ...defaultSchema.attributes,
-    div: [...(defaultSchema.attributes?.div || []), 'className'],
-    span: [...(defaultSchema.attributes?.span || []), 'className'],
+    div: [...(defaultSchema.attributes?.div || []), ['className', /^math|katex|table-scroll-wrapper$/]],
+    span: [...(defaultSchema.attributes?.span || []), ['className', /^math|katex$/]],
   },
 };
 
@@ -100,19 +104,46 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   // collision-safe IDs across tabs. Fall back to Date.now()+counter+random
   // for older browsers. The old makeId used Date.now()+counter only, which
   // could collide across browser tabs opened in the same millisecond.
-  const makeId = () => {
+  // M6 fix: wrap in useCallback so it's stable and can be safely used in
+  // useEffect dependency arrays without stale-closure risk.
+  const makeId = useCallback(() => {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
       return `msg-${crypto.randomUUID()}`;
     }
     return `msg-${Date.now()}-${idCounterRef.current++}-${Math.random().toString(36).slice(2, 8)}`;
-  };
+  }, []);
 
   const chatContentRef = useRef(null);
   const bottomRef = useRef(null);
   const autoScrollRef = useRef(true);
 
   const handleCopy = (content, id) => {
-    navigator.clipboard.writeText(content).then(() => {
+    // M10 fix: clipboard API requires HTTPS or localhost. Fall back to a
+    // temporary textarea + execCommand for non-secure contexts.
+    const copyToClipboard = (text) => {
+      if (navigator.clipboard && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+        return navigator.clipboard.writeText(text);
+      }
+      // Fallback for non-secure contexts
+      return new Promise((resolve, reject) => {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          resolve();
+        } catch (e) {
+          reject(e);
+        } finally {
+          document.body.removeChild(textarea);
+        }
+      });
+    };
+
+    copyToClipboard(content).then(() => {
       setCopiedId(id);
       setTimeout(() => setCopiedId((current) => (current === id ? null : current)), 1500);
     }).catch(() => {});
@@ -143,16 +174,19 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`http://127.0.0.1:8000/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
+      fetch(`${API_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
         .then(res => res.json())
         .then(data => {
-          setMessages((data.messages || []).map((m) => ({ ...m, id: makeId() })));
+          // M7 fix: only generate IDs for messages that don't already have one,
+          // so React doesn't remount every chat bubble (which loses copy state
+          // and re-runs KaTeX rendering) on every load.
+          setMessages((data.messages || []).map((m) => ({ ...m, id: m.id || makeId() })));
         })
         .catch(err => console.error("Error loading chat:", err));
     } else {
       setMessages([]);
     }
-  }, [activeChatId, resetKey, deviceId]);
+  }, [activeChatId, resetKey, deviceId, makeId]);
 
   const handleSend = async () => {
     if (!inputValue.trim() || isAiTyping) return;
@@ -177,14 +211,22 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
         formData.append("chat_id", activeChatId);
       }
 
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
         body: formData,
       });
 
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || "Failed to get AI response");
+        // M5 fix: don't assume the error response is JSON — the server may
+        // return plain text or HTML (e.g. a proxy error page).
+        let errDetail;
+        try {
+          const err = await response.json();
+          errDetail = err.detail || err.message || `Server error (${response.status})`;
+        } catch {
+          errDetail = `Server error (${response.status})`;
+        }
+        throw new Error(errDetail);
       }
 
       const data = await response.json();
@@ -293,14 +335,21 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
       <div className="chat-input-container">
         <div className="input-wrapper">
-          <input
-            type="text"
-            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document..."}
+          {/* M16 fix: use a textarea so Shift+Enter creates a newline and
+              Enter sends. The old single-line input couldn't do multi-line. */}
+          <textarea
+            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document... (Shift+Enter for newline)"}
             className="chat-input"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
             disabled={isUploading}
+            rows={1}
           />
           <button className="send-btn" onClick={handleSend} disabled={isUploading || isAiTyping}>➤</button>
         </div>
@@ -311,3 +360,4 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 }
 
 export default MainChat;
+

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import './SettingsModal.css';
 
-function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
+function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey, onLogout }) {
   const [tempKey, setTempKey] = useState(apiKey);
 
   if (!isOpen) return null;
@@ -11,10 +11,17 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
     onClose();
   };
 
+  // M9 fix: call onLogout prop instead of reloading the page, so in-flight
+  // uploads and chat state aren't jarringly lost.
   const handleLogout = () => {
     localStorage.removeItem("device_id");
     sessionStorage.removeItem("groq_api_key");
-    window.location.reload();
+    if (onLogout) {
+      onLogout();
+    } else {
+      window.location.reload();
+    }
+    onClose();
   };
 
   return (
