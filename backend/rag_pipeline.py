@@ -211,9 +211,15 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
             text = page.get_text("text")
 
             # If almost no digital text was found, this page is likely scanned or
-            # handwritten — fall back to a Groq vision model to read it from an image
+            # handwritten — fall back to a Groq vision model to read it from an image.
+            # H14 fix: skip the vision call if the page has no images either
+            # (a truly blank page), to avoid wasting Groq quota on empty pages.
             if len(text.strip()) < MIN_TEXT_CHARS:
-                if groq_api_key:
+                page_images = page.get_images()
+                if not page_images and len(text.strip()) == 0:
+                    # Truly blank page — no text, no images. Skip vision entirely.
+                    text = "[Blank page]"
+                elif groq_api_key:
                     text = _extract_text_via_vision(page, groq_api_key) or text
                 else:
                     text += "\n[Note: this page appears to be scanned/handwritten but could not be analyzed — GROQ_API_KEY not configured]"
@@ -303,11 +309,27 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         assume you already know its contents, and never guess at what it says
         without searching first. Returns the most relevant excerpts, each labeled
         with its page number."""
-        results = vs.similarity_search(query, k=4)
-        if not results:
+        # H12 fix: use similarity_search_with_score and filter by a score
+        # threshold so totally irrelevant chunks aren't returned (which would
+        # fuel hallucination). Chroma returns L2 distance — lower is better.
+        # A threshold of 1.0 is a reasonable default for bge-small-en-v1.5.
+        try:
+            results_with_scores = vs.similarity_search_with_score(query, k=4)
+        except Exception:
+            results_with_scores = []
+
+        if not results_with_scores:
             return "No document has been uploaded yet, or the document index is empty."
+
+        # Filter out chunks with a high distance score (low relevance)
+        SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "1.0"))
+        filtered = [(doc, score) for doc, score in results_with_scores if score <= SCORE_THRESHOLD]
+
+        if not filtered:
+            return "No sufficiently relevant content was found in the uploaded document for this query."
+
         parts = []
-        for doc in results:
+        for doc, score in filtered:
             page = doc.metadata.get("page")
             if page is not None and page not in source_pages_used:
                 source_pages_used.append(page)
@@ -326,8 +348,9 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
 7. FORMATTING: Use natural paragraphs and clear Markdown formatting (headers, bullet points, bold text) to make your response easy to read. Do NOT use Markdown tables unless the user explicitly requests one, or you are directly extracting a table from the document.
 8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\\\\[...\\\\]` or `\\\\(...\\\\)` delimiters."""
 
-    # Determine model to use (allow override via env var)
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    # H5 fix: use a current, widely-available Groq model as the default instead
+    # of "openai/gpt-oss-120b" which may be decommissioned. Allow override via env.
+    model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # Initialize Groq LLM
     llm = ChatGroq(
@@ -346,7 +369,20 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         if role == "user":
             messages.append(HumanMessage(content=content))
         elif role == "ai":
-            messages.append(AIMessage(content=content))
+            # H9 fix: replay tool_calls if they were stored on the AI message,
+            # so multi-turn tool conversations maintain full context.
+            tool_calls = turn.get("tool_calls")
+            if tool_calls:
+                messages.append(AIMessage(content=content, tool_calls=tool_calls))
+            else:
+                messages.append(AIMessage(content=content))
+        elif role == "tool":
+            # H9 fix: replay ToolMessage with its tool_call_id so the LLM can
+            # connect it to the original tool call in the conversation.
+            messages.append(ToolMessage(
+                content=content,
+                tool_call_id=turn.get("tool_call_id", "unknown")
+            ))
     messages.append(HumanMessage(content=question))
 
     tools_used = []
@@ -364,10 +400,30 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
                 if call["name"] not in tools_used:
                     tools_used.append(call["name"])
                 tool_fn = tools_by_name.get(call["name"])
-                result = tool_fn.invoke(call["args"]) if tool_fn else f"Error: unknown tool '{call['name']}'"
+                # H11 fix: validate that call["args"] is a dict before invoking;
+                # some models return malformed args (string, None) that crash
+                # the tool function.
+                args = call.get("args")
+                if not isinstance(args, dict):
+                    result = f"Error: invalid tool arguments (expected a JSON object, got {type(args).__name__})"
+                elif tool_fn:
+                    try:
+                        result = tool_fn.invoke(args)
+                    except Exception as tool_err:
+                        result = f"Error executing tool '{call['name']}': {tool_err}"
+                else:
+                    result = f"Error: unknown tool '{call['name']}'"
                 messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
             ai_msg = llm_with_tools.invoke(messages)
             rounds += 1
+
+        # H10 fix: if we hit max_tool_rounds and the model is still requesting
+        # tools, do a final invoke WITHOUT tools bound so it must produce a
+        # text answer instead of returning an empty/tool-call-only message.
+        if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
+            final_msg = llm.invoke(messages + [ai_msg])
+            answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+            return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
 
         return {"answer": ai_msg.content, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
     except Exception as e:

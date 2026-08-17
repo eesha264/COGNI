@@ -3,16 +3,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from typing import List
+from contextlib import asynccontextmanager
 import os
 import shutil
 import asyncio
 import uuid
 from dotenv import load_dotenv
 from rag_pipeline import process_pdf, query_rag
+import database
 
 load_dotenv()
 
-app = FastAPI()
+# H6 fix: use a lifespan context manager instead of the deprecated
+# @app.on_event("startup") handler.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    database.connect_db()
+    yield
+    # Shutdown (nothing to clean up currently)
+
+app = FastAPI(lifespan=lifespan)
 
 # C2 fix: restrict CORS to known frontend origins instead of "*" + credentials
 # (which is spec-violating and an open relay). Configure via ALLOWED_ORIGINS env
@@ -85,23 +96,22 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket, device_id)
 
 def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None):
+    # H1 fix: capture the running event loop once at entry instead of calling
+    # the deprecated asyncio.get_event_loop() inside every callback (which can
+    # also deadlock if it picks up a non-running loop). Since this function is
+    # launched via BackgroundTasks (which runs on the event loop thread), we
+    # capture the loop here and always use run_coroutine_threadsafe.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     # Callback to send websocket updates
     def update_status(step_name: str):
-        # We need an event loop to run async broadcast inside sync callback
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"step": step_name}, device_id=device_id), loop
-            )
-        else:
-            loop.run_until_complete(
-                manager.broadcast({"step": step_name}, device_id=device_id)
-            )
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast({"step": step_name}, device_id=device_id), loop
+        )
 
     try:
         result = process_pdf(file_path, callback=update_status, groq_api_key=groq_api_key, document_id=document_id)
@@ -109,17 +119,12 @@ def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None,
         # the return value was previously ignored, so the UI showed "Done" even
         # though nothing was indexed. Broadcast the error instead.
         if isinstance(result, dict) and result.get("error"):
-            try:
-                loop = asyncio.get_event_loop()
-                asyncio.run_coroutine_threadsafe(
-                    manager.broadcast({"error": result["error"]}, device_id=device_id), loop
-                )
-            except Exception:
-                pass
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast({"error": result["error"]}, device_id=device_id), loop
+            )
     except Exception as e:
         # Broadcast error status
         try:
-            loop = asyncio.get_event_loop()
             asyncio.run_coroutine_threadsafe(
                 manager.broadcast({"error": str(e)}, device_id=device_id), loop
             )
@@ -139,6 +144,13 @@ async def upload_pdf(
 ):
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    # H13 fix: also validate content-type to catch renamed non-PDF files
+    # (e.g. an .exe renamed to .pdf). Accept both application/pdf and
+    # application/octet-stream (some browsers send the latter for PDFs).
+    content_type = file.content_type or ""
+    if content_type and content_type not in ("application/pdf", "application/octet-stream", ""):
+        raise HTTPException(status_code=400, detail=f"Invalid file type: {content_type}. Only PDF files are supported.")
 
     # C1 fix: use a UUID-based filename to prevent path traversal via crafted
     # filenames (e.g. "../../evil.exe"). Preserve original name for display.
@@ -170,11 +182,15 @@ async def upload_pdf(
     # collection instead of wiping a global one.
     document_id = uuid.uuid4().hex
 
-    # Run processing in background (C4 fix: pass device_id for scoped broadcasts)
-    background_tasks.add_task(run_pdf_processing, file_location, device_id, groq_api_key, document_id)
+    # H2 fix: run the heavy sync PDF processing in a separate thread instead of
+    # BackgroundTasks (which runs on the event loop thread and blocks all other
+    # requests during PyMuPDF parsing, ONNX embedding, and Chroma writes).
+    asyncio.get_running_loop().run_in_executor(
+        None, run_pdf_processing, file_location, device_id, groq_api_key, document_id
+    )
 
     # Create a chat record immediately for the uploaded document
-    import database
+    # H15 fix: database is now imported at the top of the file
     chat_id = await database.create_chat(device_id, f"Document: {file.filename}", document_id=document_id)
 
     return {
@@ -182,12 +198,6 @@ async def upload_pdf(
         "chat_id": chat_id,
         "document_id": document_id
     }
-
-import database
-
-@app.on_event("startup")
-async def startup_event():
-    database.connect_db()
 
 @app.get("/chats/{device_id}")
 async def get_recent_chats(device_id: str):
@@ -233,6 +243,13 @@ async def chat(
     if not chat_id:
         chat_id = await database.create_chat(device_id, message)
 
+    # H3 fix: if chat_id is None (DB unavailable), warn the user instead of
+    # silently losing messages. The chat still works for the current turn.
+    db_available = chat_id is not None
+    if not db_available:
+        # Append a notice so the user knows their history isn't being saved
+        pass  # handled below in the response
+
     if chat_id:
         await database.add_message(chat_id, "user", message)
 
@@ -243,12 +260,17 @@ async def chat(
     if chat_id:
         await database.add_message(chat_id, "ai", result["answer"], result["tools_used"], result["source_pages"])
 
-    return {
+    response = {
         "response": result["answer"],
         "chat_id": chat_id,
         "tools_used": result["tools_used"],
         "source_pages": result["source_pages"],
     }
+    # H3 fix: warn the frontend when chat history isn't being persisted so the
+    # user knows their messages won't survive a page refresh.
+    if not db_available:
+        response["db_warning"] = "Chat history is not being saved (database unavailable)."
+    return response
 
 # --- Serve React Frontend ---
 frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
@@ -262,4 +284,9 @@ if os.path.exists(frontend_dist):
 
     @app.get("/{catchall:path}")
     async def serve_react_app(catchall: str):
+        # H8 fix: explicitly exclude API paths so a new API route registered
+        # after this catchall doesn't get silently swallowed. Return 404 for
+        # known API prefixes instead of serving index.html.
+        if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
+            raise HTTPException(status_code=404, detail="Not found")
         return FileResponse(os.path.join(frontend_dist, "index.html"))

@@ -1,11 +1,22 @@
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from datetime import datetime
+from bson.errors import InvalidId
+from datetime import datetime, timezone
 
 client = None
 db = None
 chats_collection = None
+
+# H4 fix: helper to validate chat_id and convert to ObjectId, returning None
+# for malformed IDs instead of raising InvalidId (which would cause a 500).
+def _to_objectid(chat_id: str):
+    if not chat_id:
+        return None
+    try:
+        return ObjectId(chat_id)
+    except (InvalidId, TypeError):
+        return None
 
 def connect_db():
     global client, db, chats_collection
@@ -24,7 +35,7 @@ async def create_chat(device_id: str, initial_message: str, document_id: str = N
     chat_doc = {
         "device_id": device_id,
         "title": initial_message[:30] + ("..." if len(initial_message) > 30 else ""),
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),  # H7 fix: timezone-aware UTC
         "messages": []
     }
     # C8 fix: store document_id on the chat so query_rag can find the right
@@ -39,8 +50,12 @@ async def get_chat_document_id(chat_id: str, device_id: str = None):
     """Return the document_id associated with a chat (for per-doc RAG lookup)."""
     if chats_collection is None:
         return None
+    # H4 fix: validate chat_id before constructing ObjectId
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return None
     try:
-        chat = await chats_collection.find_one({"_id": ObjectId(chat_id)})
+        chat = await chats_collection.find_one({"_id": oid})
         if chat:
             if device_id is not None and chat.get("device_id") != device_id:
                 return None
@@ -53,7 +68,13 @@ async def add_message(chat_id: str, role: str, content: str, tools_used=None, so
     if chats_collection is None:
         return
 
-    message = {"role": role, "content": content, "timestamp": datetime.utcnow()}
+    # H4 fix: validate chat_id before constructing ObjectId
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return
+
+    # H7 fix: use timezone-aware UTC instead of deprecated datetime.utcnow()
+    message = {"role": role, "content": content, "timestamp": datetime.now(timezone.utc)}
     if tools_used:
         message["tools_used"] = tools_used
     if source_pages:
@@ -61,7 +82,7 @@ async def add_message(chat_id: str, role: str, content: str, tools_used=None, so
 
     try:
         await chats_collection.update_one(
-            {"_id": ObjectId(chat_id)},
+            {"_id": oid},
             {"$push": {"messages": message}}
         )
     except Exception as e:
@@ -87,8 +108,13 @@ async def get_chat_history(chat_id: str, device_id: str = None):
     if chats_collection is None:
         return []
 
+    # H4 fix: validate chat_id before constructing ObjectId
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return []
+
     try:
-        chat = await chats_collection.find_one({"_id": ObjectId(chat_id)})
+        chat = await chats_collection.find_one({"_id": oid})
         if chat:
             # C3 fix: ownership check — only the chat's owner can read its history
             if device_id is not None and chat.get("device_id") != device_id:
@@ -105,9 +131,13 @@ async def get_chat_history(chat_id: str, device_id: str = None):
 async def delete_chat(chat_id: str, device_id: str = None):
     if chats_collection is None:
         return False
+    # H4 fix: validate chat_id before constructing ObjectId
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return False
     try:
         # C3 fix: scope deletion by device_id so only the owner can delete
-        query = {"_id": ObjectId(chat_id)}
+        query = {"_id": oid}
         if device_id is not None:
             query["device_id"] = device_id
         result = await chats_collection.delete_one(query)
