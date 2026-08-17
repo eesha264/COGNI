@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -115,8 +115,8 @@ async def startup_event():
     database.connect_db()
 
 @app.get("/chats/{device_id}")
-async def get_recent_chats(device_id: str):
-    chats = await database.get_chats(device_id)
+async def get_recent_chats(device_id: str, limit: int = Query(100, ge=1, le=500)):
+    chats = await database.get_chats(device_id, limit=limit)
     return {"chats": chats}
 
 @app.get("/chat/{chat_id}")
@@ -168,14 +168,31 @@ async def chat(
 
 # --- Serve React Frontend ---
 frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
+frontend_assets = os.path.join(frontend_dist, "assets")
 
-if os.path.exists(frontend_dist):
-    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+# Ensure the directory exists (even empty) rather than relying on check_dir=False
+# alone: Starlette's per-request StaticFiles lookup gracefully 404s a missing FILE
+# within an existing directory, but throws an unhandled OSError (-> 500) if the
+# base directory itself is entirely absent. Creating it eagerly means requests to
+# /assets/* correctly 404 instead of 500 before a build exists, and — combined
+# with check_dir=False skipping the old construction-time-only crash — the routes
+# also start actually serving files immediately once `npm run build` runs, with
+# no server restart needed (unlike the old import-time-only os.path.exists check).
+os.makedirs(frontend_assets, exist_ok=True)
+app.mount("/assets", StaticFiles(directory=frontend_assets, check_dir=False), name="assets")
 
-    @app.get("/")
-    async def serve_react_app_root():
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
 
-    @app.get("/{catchall:path}")
-    async def serve_react_app(catchall: str):
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+@app.get("/")
+async def serve_react_app_root():
+    index_path = os.path.join(frontend_dist, "index.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend build not found. Run `npm run build` in the frontend directory.")
+    return FileResponse(index_path)
+
+
+@app.get("/{catchall:path}")
+async def serve_react_app(catchall: str):
+    index_path = os.path.join(frontend_dist, "index.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend build not found. Run `npm run build` in the frontend directory.")
+    return FileResponse(index_path)

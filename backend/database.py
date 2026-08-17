@@ -48,12 +48,12 @@ async def add_message(chat_id: str, role: str, content: str, tools_used=None, so
     except Exception as e:
         print(f"Error adding message to DB: {e}")
 
-async def get_chats(device_id: str):
+async def get_chats(device_id: str, limit: int = 100):
     if chats_collection is None:
         return []
-    
+
     cursor = chats_collection.find({"device_id": device_id}).sort("created_at", -1)
-    chats = await cursor.to_list(length=100)
+    chats = await cursor.to_list(length=limit)
     
     result = []
     for c in chats:

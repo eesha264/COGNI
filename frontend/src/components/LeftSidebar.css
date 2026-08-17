@@ -6,6 +6,13 @@
   padding: 24px;
   color: var(--text-dark-primary);
   height: 100%;
+  transition: width 0.2s ease;
+}
+
+.left-sidebar.collapsed {
+  width: 56px;
+  padding: 24px 0;
+  align-items: center;
 }
 
 .sidebar-header {

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import './SettingsModal.css';
 
-function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
+function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey, onLogout }) {
   const [tempKey, setTempKey] = useState(apiKey);
 
   if (!isOpen) return null;
@@ -9,12 +9,6 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
   const handleSave = () => {
     onSaveApiKey(tempKey);
     onClose();
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem("device_id");
-    localStorage.removeItem("groq_api_key");
-    window.location.reload();
   };
 
   return (
@@ -38,7 +32,7 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey }) {
           </div>
         </div>
         <div className="modal-footer" style={{justifyContent: 'space-between'}}>
-          <button className="cancel-btn" style={{color: '#ef4444', borderColor: '#ef4444', backgroundColor: 'transparent'}} onClick={handleLogout}>Log out</button>
+          <button className="cancel-btn" style={{color: '#ef4444', borderColor: '#ef4444', backgroundColor: 'transparent'}} onClick={onLogout}>Log out</button>
           <div style={{display: 'flex', gap: '8px'}}>
             <button className="cancel-btn" onClick={onClose}>Cancel</button>
             <button className="save-btn" onClick={handleSave}>Save</button>

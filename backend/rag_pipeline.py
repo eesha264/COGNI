@@ -2,6 +2,7 @@ import os
 import ast
 import base64
 import operator
+import time
 from datetime import datetime
 import pymupdf  # fitz
 from tavily import TavilyClient
@@ -12,18 +13,43 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 
-# Initialize the Embeddings
-# FastEmbed is lightweight and runs locally without needing an API key for embeddings
-embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+# Embeddings and the vector store are expensive to set up (FastEmbed loads/
+# downloads a model; Chroma opens the on-disk index) — initialize them lazily on
+# first actual use instead of at import time, so the server starts instantly and
+# doesn't crash on import if chroma_db happens to be locked or corrupted.
+_embeddings = None
+_vector_store = None
 
-# Initialize Vector Store
-vector_store = Chroma(
-    collection_name="pdf_docs",
-    embedding_function=embeddings,
-    persist_directory="./chroma_db"
-)
 
-import time
+def _get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        # FastEmbed is lightweight and runs locally without needing an API key
+        _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    return _embeddings
+
+
+def _get_vector_store():
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = Chroma(
+            collection_name="pdf_docs",
+            embedding_function=_get_embeddings(),
+            persist_directory="./chroma_db"
+        )
+    return _vector_store
+
+
+def _reset_vector_store():
+    """Wipes and recreates the collection — used by process_pdf() for a new upload."""
+    global _vector_store
+    _get_vector_store().delete_collection()
+    _vector_store = Chroma(
+        collection_name="pdf_docs",
+        embedding_function=_get_embeddings(),
+        persist_directory="./chroma_db"
+    )
+    return _vector_store
 
 # --- Tools available to the LLM (bound in query_rag via bind_tools) ---
 
@@ -73,28 +99,9 @@ def get_current_datetime() -> str:
     return now.strftime("%A, %B %d, %Y at %I:%M %p (server local time)")
 
 
-@tool
-def web_search(query: str) -> str:
-    """Search the live web for information not in the uploaded document and not reliably
-    known from memory — current events, weather, prices, or any fact that could have
-    changed since training. Use this instead of guessing whenever precision matters."""
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return "Error: web search is not configured (missing TAVILY_API_KEY)."
-    try:
-        client = TavilyClient(api_key=api_key)
-        response = client.search(query, max_results=3, include_answer=True)
-        if response.get("answer"):
-            return response["answer"]
-        results = response.get("results", [])
-        if not results:
-            return "No web results found for that query."
-        return "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
-    except Exception as e:
-        return f"Error performing web search: {e}"
+MAX_WEB_SEARCHES_PER_CONVERSATION = 5  # web_search is created per-call in query_rag(), see there
 
-
-AVAILABLE_TOOLS = [calculator, get_current_datetime, web_search]
+AVAILABLE_TOOLS = [calculator, get_current_datetime]
 _TOOLS_BY_NAME = {t.name: t for t in AVAILABLE_TOOLS}
 
 # A page with less than this many non-whitespace characters of embedded digital
@@ -130,7 +137,6 @@ def process_pdf(file_path: str, callback=None):
     """
     Extracts text, tables, and image metadata from a PDF up to 400 pages.
     """
-    global vector_store
     if callback:
         callback("Analyzing the pdf")
     time.sleep(1)
@@ -205,12 +211,7 @@ def process_pdf(file_path: str, callback=None):
     doc.close()
 
     # Clear the old vector store collection for a new document upload
-    vector_store.delete_collection()
-    vector_store = Chroma(
-        collection_name="pdf_docs",
-        embedding_function=embeddings,
-        persist_directory="./chroma_db"
-    )
+    vector_store = _reset_vector_store()
 
     # Add new chunks, tagged with their source page
     vector_store.add_texts(all_chunks, metadatas=all_metadatas)
@@ -247,6 +248,41 @@ def query_rag(question: str, groq_api_key: str, history=None):
     # relevant from irrelevant content, especially on small documents).
     source_pages_used = []
 
+    # web_search call budget for this conversation: count turns that already used
+    # it (from history) plus calls made in this turn, so one long conversation
+    # can't burn through the Tavily quota unbounded.
+    prior_search_count = sum(
+        1 for m in (history or []) if m.get("role") == "ai" and "web_search" in (m.get("tools_used") or [])
+    )
+    search_calls_this_turn = [0]
+
+    @tool
+    def web_search(query: str) -> str:
+        """Search the live web for information not in the uploaded document and not reliably
+        known from memory — current events, weather, prices, or any fact that could have
+        changed since training. Use this instead of guessing whenever precision matters."""
+        if prior_search_count + search_calls_this_turn[0] >= MAX_WEB_SEARCHES_PER_CONVERSATION:
+            return (
+                f"Error: web search limit reached for this conversation (max {MAX_WEB_SEARCHES_PER_CONVERSATION}). "
+                "Answer using what you already know or have already found, and tell the user "
+                "live search is unavailable for the rest of this conversation."
+            )
+        search_calls_this_turn[0] += 1
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            return "Error: web search is not configured (missing TAVILY_API_KEY)."
+        try:
+            client = TavilyClient(api_key=api_key)
+            response = client.search(query, max_results=3, include_answer=True)
+            if response.get("answer"):
+                return response["answer"]
+            results = response.get("results", [])
+            if not results:
+                return "No web results found for that query."
+            return "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+        except Exception as e:
+            return f"Error performing web search: {e}"
+
     @tool
     def search_document(query: str) -> str:
         """Search the uploaded document for content relevant to a query. Use this
@@ -254,7 +290,7 @@ def query_rag(question: str, groq_api_key: str, history=None):
         assume you already know its contents, and never guess at what it says
         without searching first. Returns the most relevant excerpts, each labeled
         with its page number."""
-        results = vector_store.similarity_search(query, k=4)
+        results = _get_vector_store().similarity_search(query, k=4)
         if not results:
             return "No document has been uploaded yet, or the document index is empty."
         parts = []
@@ -286,8 +322,8 @@ def query_rag(question: str, groq_api_key: str, history=None):
         groq_api_key=groq_api_key,
         model_name=model_name,
     )
-    call_tools = AVAILABLE_TOOLS + [search_document]
-    tools_by_name = {**_TOOLS_BY_NAME, "search_document": search_document}
+    call_tools = AVAILABLE_TOOLS + [search_document, web_search]
+    tools_by_name = {**_TOOLS_BY_NAME, "search_document": search_document, "web_search": web_search}
     llm_with_tools = llm.bind_tools(call_tools)
 
     messages = [SystemMessage(content=system_prompt)]

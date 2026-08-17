@@ -1,14 +1,22 @@
 import React from 'react';
 import './LeftSidebar.css';
 
-function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectChat, onDeleteChat }) {
+function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectChat, onDeleteChat, isCollapsed, onToggleCollapse }) {
+  if (isCollapsed) {
+    return (
+      <div className="left-sidebar collapsed">
+        <button className="collapse-btn" onClick={onToggleCollapse} title="Expand sidebar">◫</button>
+      </div>
+    );
+  }
+
   return (
     <div className="left-sidebar">
       <div className="sidebar-header">
         <div className="logo">
           <span className="logo-text">COGNI</span>
         </div>
-        <button className="collapse-btn">◫</button>
+        <button className="collapse-btn" onClick={onToggleCollapse} title="Collapse sidebar">◫</button>
       </div>
 
       <nav className="sidebar-nav">

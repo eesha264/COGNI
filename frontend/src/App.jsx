@@ -3,16 +3,26 @@ import LeftSidebar from './components/LeftSidebar';
 import MainChat from './components/MainChat';
 import RightSidebar from './components/RightSidebar';
 import SettingsModal from './components/SettingsModal';
+import { API_BASE_URL, WS_BASE_URL } from './config';
+
+// crypto.randomUUID() gives 122 bits of entropy and is available in all secure
+// contexts (localhost included); fall back only if it's genuinely unavailable.
+const generateDeviceId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return 'device-' + crypto.randomUUID();
+  }
+  return 'device-' + Math.random().toString(36).slice(2, 11);
+};
 
 function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeStep, setActiveStep] = useState("");
   const [isUploading, setIsUploading] = useState(false);
-  const [deviceId] = useState(() => {
+  const [deviceId, setDeviceId] = useState(() => {
     let id = localStorage.getItem("device_id");
     if (!id) {
-      id = "device-" + Math.random().toString(36).substr(2, 9);
+      id = generateDeviceId();
       localStorage.setItem("device_id", id);
     }
     return id;
@@ -20,11 +30,28 @@ function App() {
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [resetKey, setResetKey] = useState(0);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const wsRef = useRef(null);
 
   const handleSaveApiKey = (key) => {
     localStorage.setItem("groq_api_key", key);
     setApiKey(key);
+  };
+
+  // Resets everything in-app instead of a full page reload — a fresh device_id,
+  // cleared api key, and an empty chat list. fetchChats() re-runs automatically
+  // since it depends on deviceId, confirming the (empty) list for the new id.
+  const handleLogout = () => {
+    localStorage.removeItem("device_id");
+    localStorage.removeItem("groq_api_key");
+    const newDeviceId = generateDeviceId();
+    localStorage.setItem("device_id", newDeviceId);
+    setDeviceId(newDeviceId);
+    setApiKey("");
+    setChats([]);
+    setActiveChatId(null);
+    setResetKey(prev => prev + 1);
+    setIsSettingsOpen(false);
   };
 
   const startWebSocket = () => {
@@ -37,7 +64,7 @@ function App() {
     }
 
     // Connect to backend websocket
-    const ws = new WebSocket("ws://127.0.0.1:8000/ws/process");
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/process`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
@@ -68,7 +95,7 @@ function App() {
 
   const fetchChats = React.useCallback(async () => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/chats/${deviceId}`);
+      const res = await fetch(`${API_BASE_URL}/chats/${deviceId}`);
       if (res.ok) {
         const data = await res.json();
         setChats(data.chats || []);
@@ -90,7 +117,7 @@ function App() {
 
   const handleDeleteChat = async (chatId) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8000/chat/${chatId}`, {
+      const response = await fetch(`${API_BASE_URL}/chat/${chatId}`, {
         method: "DELETE"
       });
 
@@ -122,7 +149,7 @@ function App() {
     formData.append("device_id", deviceId);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/upload", {
+      const response = await fetch(`${API_BASE_URL}/upload`, {
         method: "POST",
         body: formData,
       });
@@ -162,6 +189,8 @@ function App() {
         activeChatId={activeChatId}
         onSelectChat={setActiveChatId}
         onDeleteChat={handleDeleteChat}
+        isCollapsed={isSidebarCollapsed}
+        onToggleCollapse={() => setIsSidebarCollapsed(prev => !prev)}
       />
       <MainChat
         apiKey={apiKey}
@@ -184,6 +213,7 @@ function App() {
         onClose={() => setIsSettingsOpen(false)}
         apiKey={apiKey}
         onSaveApiKey={handleSaveApiKey}
+        onLogout={handleLogout}
       />
     </div>
   );

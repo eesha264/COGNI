@@ -1,69 +1,13 @@
-import React, { useState, useRef, useEffect } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeRaw from 'rehype-raw';
-import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
-import rehypeKatex from 'rehype-katex';
-import rehypeHighlight from 'rehype-highlight';
+import React, { useState, useRef, useEffect, useCallback, Suspense, lazy } from 'react';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
-import 'highlight.js/styles/github-dark.css';
-import 'katex/dist/katex.min.css';
+import { API_BASE_URL } from '../config';
 import './MainChat.css';
 
-// AI responses sometimes contain literal HTML tags (e.g. <br> inside a table cell,
-// since markdown tables can't hold real line breaks). rehypeRaw parses that HTML;
-// rehypeSanitize then strips anything unsafe (scripts, event handlers, iframes)
-// before it's rendered, since this content comes from a model, not a trusted source.
-// The math/math-inline/math-display classes are remark-math's markers for content
-// rehypeKatex still needs to find and render after sanitizing.
-const sanitizeSchema = {
-  ...defaultSchema,
-  tagNames: [...(defaultSchema.tagNames || []), 'br'],
-  attributes: {
-    ...defaultSchema.attributes,
-    div: [...(defaultSchema.attributes?.div || []), 'className'],
-    span: [...(defaultSchema.attributes?.span || []), 'className'],
-  },
-};
-
-// remark-math only recognizes $...$ / $$...$$ delimiters, but models frequently
-// write \(...\) / \[...\] instead regardless of prompt instructions — convert
-// those to the delimiters remark-math understands before rendering.
-const normalizeLatexDelimiters = (text) => {
-  if (!text) return text;
-  return text
-    .replace(/\\\[/g, () => '$$')
-    .replace(/\\\]/g, () => '$$')
-    .replace(/\\\(/g, () => '$')
-    .replace(/\\\)/g, () => '$');
-};
-
-// Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
-// lists, blockquotes, links, fenced code blocks with syntax highlighting, and
-// LaTeX math ($...$ inline, $$...$$ block) typeset via KaTeX.
-const renderMarkdown = (text) => {
-  if (!text) return null;
-  const normalized = normalizeLatexDelimiters(text);
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], rehypeKatex, rehypeHighlight]}
-      components={{
-        a: ({ node: _node, ...props }) => (
-          <a {...props} target="_blank" rel="noopener noreferrer" />
-        ),
-        table: ({ node: _node, ...props }) => (
-          <div className="table-scroll-wrapper">
-            <table {...props} />
-          </div>
-        ),
-      }}
-    >
-      {normalized}
-    </ReactMarkdown>
-  );
-};
+// Lazily loaded — react-markdown + remark/rehype plugins + katex + highlight.js
+// are heavy (pushed the bundle past 500KB) and aren't needed until an AI message
+// actually needs rendering, so they're split into their own chunk instead of
+// always being part of the initial bundle (e.g. for the empty state).
+const MarkdownRenderer = lazy(() => import('./MarkdownRenderer'));
 
 const formatTimestamp = (ts) => {
   if (!ts) return '';
@@ -76,21 +20,51 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
   const [isAiTyping, setIsAiTyping] = useState(false);
-  const [copiedId, setCopiedId] = useState(null);
+  const [copyState, setCopyState] = useState(null); // { id, status: 'success' | 'failed' }
   const [showScrollButton, setShowScrollButton] = useState(false);
 
   const idCounterRef = useRef(0);
-  const makeId = () => `msg-${Date.now()}-${idCounterRef.current++}`;
+  const makeId = useCallback(() => `msg-${Date.now()}-${idCounterRef.current++}`, []);
 
   const chatContentRef = useRef(null);
   const bottomRef = useRef(null);
+  const textareaRef = useRef(null);
+  const MAX_TEXTAREA_HEIGHT = 160;
+
+  // Auto-grow the input as the user types multi-line messages, up to a max
+  // height, beyond which it scrolls internally instead of growing forever.
+  // Deferred to the next animation frame because measuring scrollHeight
+  // immediately (e.g. on first mount) can race the flex layout still settling,
+  // reading a near-zero width and wrapping the placeholder into dozens of lines
+  // — that bad measurement then gets locked in since this effect only re-runs
+  // on inputValue changes, not once layout stabilizes a moment later.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [inputValue]);
   const autoScrollRef = useRef(true);
 
+  const showCopyState = (id, status) => {
+    setCopyState({ id, status });
+    setTimeout(() => setCopyState((s) => (s?.id === id ? null : s)), 1500);
+  };
+
   const handleCopy = (content, id) => {
-    navigator.clipboard.writeText(content).then(() => {
-      setCopiedId(id);
-      setTimeout(() => setCopiedId((current) => (current === id ? null : current)), 1500);
-    }).catch(() => {});
+    // navigator.clipboard is undefined in non-secure contexts (plain HTTP on a
+    // non-localhost origin) — without this check that throws a TypeError instead
+    // of failing gracefully like a rejected clipboard write does.
+    if (!navigator.clipboard) {
+      showCopyState(id, 'failed');
+      return;
+    }
+    navigator.clipboard.writeText(content)
+      .then(() => showCopyState(id, 'success'))
+      .catch(() => showCopyState(id, 'failed'));
   };
 
   const scrollToBottom = (behavior = 'auto') => {
@@ -118,16 +92,23 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`http://127.0.0.1:8000/chat/${activeChatId}`)
+      fetch(`${API_BASE_URL}/chat/${activeChatId}`)
         .then(res => res.json())
         .then(data => {
-          setMessages((data.messages || []).map((m) => ({ ...m, id: makeId() })));
+          // Derive a stable id from the message's own timestamp (falling back to a
+          // fresh one only if it's missing) instead of always calling makeId() —
+          // otherwise reloading the same chat regenerates every id, causing React
+          // to remount every bubble (losing copy-button state, re-running KaTeX).
+          setMessages((data.messages || []).map((m, idx) => ({
+            ...m,
+            id: m.timestamp ? `hist-${m.timestamp}-${idx}` : makeId(),
+          })));
         })
         .catch(err => console.error("Error loading chat:", err));
     } else {
       setMessages([]);
     }
-  }, [activeChatId, resetKey]);
+  }, [activeChatId, resetKey, makeId]);
 
   const handleSend = async () => {
     if (!inputValue.trim() || isAiTyping) return;
@@ -152,14 +133,20 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
         formData.append("chat_id", activeChatId);
       }
 
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         body: formData,
       });
 
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || "Failed to get AI response");
+        let message = `Failed to get AI response (server returned ${response.status})`;
+        try {
+          const err = await response.json();
+          message = err.detail || message;
+        } catch {
+          // Response body wasn't JSON (e.g. a proxy's HTML error page) — keep the generic message
+        }
+        throw new Error(message);
       }
 
       const data = await response.json();
@@ -225,15 +212,17 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
                   ) : (
                     <>
                       <button
-                        className="copy-btn"
+                        className={`copy-btn ${copyState?.id === msg.id && copyState.status === 'failed' ? 'copy-failed' : ''}`}
                         onClick={() => handleCopy(msg.content, msg.id)}
-                        title="Copy response"
+                        title={copyState?.id === msg.id && copyState.status === 'failed' ? 'Copy failed — clipboard unavailable' : 'Copy response'}
                         aria-label="Copy response"
                       >
-                        {copiedId === msg.id ? '✓' : '⧉'}
+                        {copyState?.id === msg.id ? (copyState.status === 'success' ? '✓' : '✕') : '⧉'}
                       </button>
                       <div className="markdown-render">
-                        {renderMarkdown(msg.content)}
+                        <Suspense fallback={<p>{msg.content}</p>}>
+                          <MarkdownRenderer text={msg.content} />
+                        </Suspense>
                       </div>
                       {msg.source_pages && msg.source_pages.length > 0 && (
                         <div className="source-footer">
@@ -268,13 +257,19 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
       <div className="chat-input-container">
         <div className="input-wrapper">
-          <input
-            type="text"
-            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document..."}
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document... (Shift+Enter for a new line)"}
             className="chat-input"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
             disabled={isUploading}
           />
           <button className="send-btn" onClick={handleSend} disabled={isUploading || isAiTyping}>➤</button>
