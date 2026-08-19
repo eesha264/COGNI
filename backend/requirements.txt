@@ -11,3 +11,32 @@ fastembed==0.8.0
 langchain-community==0.4.2
 motor==3.7.1
 tavily-python==0.7.27
+presidio-analyzer==2.2.364
+spacy==3.8.15
+# spaCy's model isn't pip-installable by name — after installing the above,
+# run: python -m spacy download en_core_web_sm (pins to spacy==3.8.15's
+# compatible model release, currently en_core_web_sm 3.8.0). en_core_web_sm
+# over en_core_web_lg: 15MB vs 432MB, <1 point NER F-score difference — see
+# the comment in pii_guard.py.
+#
+# presidio-anonymizer is deliberately NOT installed — Cogni never imports it
+# (pii_guard.py uses AnalyzerEngine only, with its own TokenStore instead of
+# Presidio's built-in encrypt/decrypt operator). Installing it would also
+# pull in the `cryptography` package (~24MB) purely to back that unused
+# operator.
+#
+# Optional, for a leaner footprint (~110MB more): kubernetes, grpcio, and
+# the opentelemetry-exporter-otlp-proto-grpc family are hard (non-optional)
+# transitive dependencies of chromadb, but are only imported by its
+# distributed/cluster-mode and telemetry-export code paths — never touched
+# by Cogni's local persistent-Chroma usage. SQLAlchemy is likewise a hard
+# dependency of langchain-community's SQL-agent tooling, unused here. All
+# four are safe to remove after install:
+#   pip uninstall -y kubernetes grpcio opentelemetry-api opentelemetry-sdk \
+#     opentelemetry-proto opentelemetry-semantic-conventions \
+#     opentelemetry-exporter-otlp-proto-common \
+#     opentelemetry-exporter-otlp-proto-grpc SQLAlchemy
+# They aren't extras-gated in chromadb/langchain-community, so a future
+# `pip install -r requirements.txt` (or an upgrade of either package) will
+# silently reinstall them — this is a one-time-per-install cleanup step,
+# not a permanent removal.

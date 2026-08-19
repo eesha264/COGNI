@@ -13,6 +13,8 @@ from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
+from guardrails import input_rail
 
 # Embeddings are expensive to set up (FastEmbed loads/downloads a model) —
 # initialize lazily on first actual use instead of at import time, so the
@@ -285,6 +287,15 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
     if not groq_api_key:
         return {"answer": "Error: Groq API key is missing. Please add it to your environment.", "tools_used": [], "source_pages": []}
 
+    # Input rail (privacy guardrails, Phase 3): block requests whose intent is
+    # to extract or unmask sensitive data before any retrieval or LLM call
+    # happens, and redact any incidental PII in an otherwise-benign question
+    # before it's ever sent to Groq.
+    gate = input_rail(question)
+    if not gate["allowed"]:
+        return {"answer": gate["reason"], "tools_used": [], "source_pages": []}
+    question = gate["query"]
+
     # C8 fix: use the per-document collection instead of the global vector_store.
     collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
     vs = get_vector_store(collection_name)
@@ -356,12 +367,27 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         if not filtered:
             return "No sufficiently relevant content was found in the uploaded document for this query."
 
+        # Retrieval rail (privacy guardrails, Phase 4): redact high-confidence
+        # PII (emails, phone numbers, card/SSN/PAN/Aadhaar numbers) out of
+        # retrieved chunks before they're appended to the message list the
+        # model sees. This is a safety net, not the primary control — the
+        # real fix is redacting at ingestion time so these values are never
+        # embedded/stored in the first place, which is separate, larger work
+        # not yet built. Deliberately uses RAIL_ENTITIES (not the broader
+        # PERSON/LOCATION set) for the same reason discovered in Phase 3:
+        # blanket-redacting every name or place in a document chunk breaks
+        # ordinary answers that legitimately reference a named person or
+        # place in the source text (e.g. "What did John Smith conclude?").
+        # Ingestion-time redaction is the right place for that broader,
+        # name-aware coverage, using a consistent per-document token scheme
+        # instead of ad hoc redaction on every retrieval.
         parts = []
         for doc, score in filtered:
             page = doc.metadata.get("page")
             if page is not None and page not in source_pages_used:
                 source_pages_used.append(page)
-            parts.append(f"[Page {page}]\n{doc.page_content}")
+            content = redact_pii(doc.page_content, TokenStore(), entities=RAIL_ENTITIES)
+            parts.append(f"[Page {page}]\n{content}")
         return "\n\n".join(parts)
 
     system_prompt = """You are Cogni, an AI assistant integrated into a document analysis system. Your top priority is being CORRECT, not sounding confident — never state something as fact unless it is grounded in a tool result or knowledge you are genuinely confident about.
@@ -374,7 +400,7 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
 5. USE CONVERSATION HISTORY: Prior messages in this conversation (if any) are included below. Use them to understand follow-up questions, pronouns ("it", "that"), and context the user already established — don't treat every message as a brand-new, unrelated conversation.
 6. TONE: Be conversational, polite, and helpful — like a careful research partner who is upfront about the limits of what they actually know.
 7. FORMATTING: Use natural paragraphs and clear Markdown formatting (headers, bullet points, bold text) to make your response easy to read. Do NOT use Markdown tables unless the user explicitly requests one, or you are directly extracting a table from the document.
-8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\\\\[...\\\\]` or `\\\\(...\\\\)` delimiters."""
+8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\[...\]` or `\(...\)` delimiters."""
 
     # The H5 finding proposed defaulting to "llama-3.3-70b-versatile" in case
     # openai/gpt-oss-120b gets decommissioned — re-verified against Groq's live
@@ -456,9 +482,18 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
             final_msg = llm.invoke(messages + [ai_msg])
             answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+            answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
 
-        return {"answer": ai_msg.content, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
+        # Output rail (privacy guardrails, Phase 2): scan the generated answer
+        # for PII before it ever reaches the frontend or gets written to chat
+        # history — a safety net for cases where the model reconstructs or
+        # guesses a sensitive value from context even when no raw PII was in
+        # its input. A fresh TokenStore per call is intentional here: this is
+        # a last-line redaction pass, not the reversible per-document mapping
+        # (that belongs to ingestion-time redaction, a separate piece of work).
+        answer = redact_pii(ai_msg.content, TokenStore(), entities=RAIL_ENTITIES)
+        return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
     except Exception as e:
         # Provide a clearer hint for model decommission errors
         err_str = str(e)
