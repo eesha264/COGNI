@@ -128,10 +128,16 @@ section("H5: Default GROQ_MODEL fixed")
 
 def test_h5():
     rag = read_file("rag_pipeline.py")
-    test("No more openai/gpt-oss-120b as default",
-         'os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")' not in rag)
-    test("Uses llama-3.3-70b-versatile as default",
-         "llama-3.3-70b-versatile" in rag)
+    # This finding originally proposed replacing openai/gpt-oss-120b with
+    # llama-3.3-70b-versatile. Re-verified against Groq's live /models
+    # endpoint during the merge: llama-3.3-70b-versatile is NOT in the
+    # current model list at all, while openai/gpt-oss-120b is (and has
+    # been used successfully throughout this project's testing) — so the
+    # original default was kept. See the comment above VISION_MODEL and
+    # model_name in rag_pipeline.py for the same fact-check on the vision
+    # model default.
+    test("Keeps the verified-working openai/gpt-oss-120b default",
+         'os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")' in rag)
     test("Still configurable via GROQ_MODEL env var",
          'os.getenv("GROQ_MODEL"' in rag)
 
