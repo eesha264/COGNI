@@ -24,7 +24,16 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   const [showScrollButton, setShowScrollButton] = useState(false);
 
   const idCounterRef = useRef(0);
-  const makeId = useCallback(() => `msg-${Date.now()}-${idCounterRef.current++}`, []);
+  // L3 fix: use crypto.randomUUID() (available in all modern browsers) for
+  // collision-safe IDs across tabs. Fall back to Date.now()+counter+random
+  // for older browsers. The old makeId used Date.now()+counter only, which
+  // could collide across browser tabs opened in the same millisecond.
+  const makeId = useCallback(() => {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return `msg-${crypto.randomUUID()}`;
+    }
+    return `msg-${Date.now()}-${idCounterRef.current++}-${Math.random().toString(36).slice(2, 8)}`;
+  }, []);
 
   const chatContentRef = useRef(null);
   const bottomRef = useRef(null);
@@ -92,7 +101,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`${API_BASE_URL}/chat/${activeChatId}`)
+      fetch(`${API_BASE_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
         .then(res => res.json())
         .then(data => {
           // Derive a stable id from the message's own timestamp (falling back to a
@@ -108,7 +117,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
     } else {
       setMessages([]);
     }
-  }, [activeChatId, resetKey, makeId]);
+  }, [activeChatId, resetKey, deviceId, makeId]);
 
   const handleSend = async () => {
     if (!inputValue.trim() || isAiTyping) return;

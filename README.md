@@ -137,7 +137,7 @@ pip install -r requirements.txt
 
 Create a `.env` file in the `backend/` directory and add your MongoDB URL:
 ```env
-MONGODB_URL=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/?appName=COGNI
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/?appName=COGNI
 ```
 
 Start the backend server:
@@ -154,7 +154,7 @@ npm run dev
 ```
 
 ### 4. Use the App
-Open your browser and navigate to `http://localhost:5174` (or whatever port Vite provides). 
+Open your browser and navigate to `http://localhost:5173` (or whatever port Vite provides).
 1. Click the **Settings** gear in the left sidebar and enter your **Groq API Key**.
 2. Click the dashed **Upload PDF** box in the right sidebar.
 3. Watch the graph animate, and start chatting with your document!
