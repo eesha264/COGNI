@@ -1,3 +1,8 @@
+# M1 fix: pin dependency versions. Exact `==` pins rather than `>=X,<Y`
+# ranges — Cogni is a deployed application, not a library other packages
+# depend on, so full reproducibility matters more than automatic minor-
+# version drift, and these exact versions are what's actually been tested
+# throughout this project (upload, query, guardrails rails, etc.).
 fastapi==0.141.1
 uvicorn==0.52.1
 langchain==1.3.14

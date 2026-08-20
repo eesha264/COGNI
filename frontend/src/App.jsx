@@ -42,9 +42,12 @@ function App() {
     setApiKey(key);
   };
 
-  // Resets everything in-app instead of a full page reload — a fresh device_id,
-  // cleared api key, and an empty chat list. fetchChats() re-runs automatically
-  // since it depends on deviceId, confirming the (empty) list for the new id.
+  // M9 fix: resets everything in-app instead of a full page reload — a fresh
+  // device_id, cleared api key, and an empty chat list. fetchChats() re-runs
+  // automatically since it depends on deviceId, confirming the (empty) list
+  // for the new id. Clears sessionStorage directly (not just React state) —
+  // otherwise a page refresh right after logout would re-read the old key
+  // back out of sessionStorage via the apiKey useState initializer above.
   const handleLogout = () => {
     localStorage.removeItem("device_id");
     sessionStorage.removeItem("groq_api_key");
@@ -52,6 +55,7 @@ function App() {
     localStorage.setItem("device_id", newDeviceId);
     setDeviceId(newDeviceId);
     setApiKey("");
+    setActiveStep("");
     setChats([]);
     setActiveChatId(null);
     setResetKey(prev => prev + 1);
@@ -230,3 +234,5 @@ function App() {
 }
 
 export default App;
+
+

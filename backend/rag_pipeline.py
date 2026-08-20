@@ -19,16 +19,20 @@ from guardrails import input_rail
 # Embeddings are expensive to set up (FastEmbed loads/downloads a model) —
 # initialize lazily on first actual use instead of at import time, so the
 # server starts instantly and doesn't crash on import if something's wrong.
+# M13 fix: double-checked locking so concurrent requests racing to
+# initialize don't each construct their own FastEmbedEmbeddings instance.
 _embeddings = None
+_embeddings_lock = threading.Lock()
 
 
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
-        # FastEmbed is lightweight and runs locally without needing an API key
-        _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        with _embeddings_lock:
+            if _embeddings is None:
+                # FastEmbed is lightweight and runs locally without needing an API key
+                _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     return _embeddings
-
 
 CHROMA_PERSIST_DIR = "./chroma_db"
 
@@ -121,6 +125,15 @@ def get_current_datetime() -> str:
 
 MAX_WEB_SEARCHES_PER_CONVERSATION = 5  # web_search is created per-call in query_rag(), see there
 
+# M20 fix: cache web_search results across calls/conversations so a repeated
+# identical query doesn't burn Tavily quota. TTL-bounded rather than kept
+# forever, since "current events/prices" queries can go stale — the whole
+# point of this tool is to fetch live data, so an indefinitely-lived cache
+# would silently start returning wrong answers.
+_web_search_cache: dict[str, tuple[float, str]] = {}
+_web_search_cache_lock = threading.Lock()
+WEB_SEARCH_CACHE_TTL = 300  # 5 minutes
+
 AVAILABLE_TOOLS = [calculator, get_current_datetime]
 _TOOLS_BY_NAME = {t.name: t for t in AVAILABLE_TOOLS}
 
@@ -168,7 +181,7 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
     """
     if callback:
         callback("Analyzing the pdf")
-    time.sleep(1)
+
 
     # C12 fix: use try/finally so the file handle is always closed, even on
     # early returns (e.g. >400 pages) or exceptions.
@@ -180,7 +193,7 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
         if callback:
             callback("Analyze images")
-        time.sleep(1)
+    
 
         # C7 fix: prefer the caller-provided key (from the browser) over the env var
         # so vision OCR works even when the server admin hasn't set GROQ_API_KEY.
@@ -242,14 +255,17 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
         if callback:
             callback("Analyze tables")
-        time.sleep(1)
+    
 
         if callback:
             callback("Convert to text")
-        time.sleep(1)
+    
 
     finally:
         doc.close()
+
+    if callback:
+        callback("Create embeddings")
 
     # C8 fix: index into a per-document collection instead of wiping a global one.
     collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
@@ -257,16 +273,11 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
     delete_vector_store(collection_name)
     vs = get_vector_store(collection_name)
 
-    # Add new chunks, tagged with their source page
-    vs.add_texts(all_chunks, metadatas=all_metadatas)
-
-    if callback:
-        callback("Create embeddings")
-    time.sleep(1)
-
     if callback:
         callback("Save to Vector DB")
-    time.sleep(1)
+
+    # Add new chunks, tagged with their source page
+    vs.add_texts(all_chunks, metadatas=all_metadatas)
 
     if callback:
         callback("Done")
@@ -319,6 +330,18 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         """Search the live web for information not in the uploaded document and not reliably
         known from memory — current events, weather, prices, or any fact that could have
         changed since training. Use this instead of guessing whenever precision matters."""
+        # M20 fix: serve from cache first. A cache hit doesn't touch Tavily
+        # or count against the per-conversation limit below, since no real
+        # search ran — only a live API call should consume that budget.
+        cache_key = query.lower().strip()
+        with _web_search_cache_lock:
+            cached = _web_search_cache.get(cache_key)
+            if cached is not None:
+                cached_time, cached_result = cached
+                if time.time() - cached_time < WEB_SEARCH_CACHE_TTL:
+                    return cached_result
+                del _web_search_cache[cache_key]
+
         if prior_search_count + search_calls_this_turn[0] >= MAX_WEB_SEARCHES_PER_CONVERSATION:
             return (
                 f"Error: web search limit reached for this conversation (max {MAX_WEB_SEARCHES_PER_CONVERSATION}). "
@@ -333,11 +356,16 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
             client = TavilyClient(api_key=api_key)
             response = client.search(query, max_results=3, include_answer=True)
             if response.get("answer"):
-                return response["answer"]
-            results = response.get("results", [])
-            if not results:
-                return "No web results found for that query."
-            return "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+                result = response["answer"]
+            else:
+                results = response.get("results", [])
+                if not results:
+                    result = "No web results found for that query."
+                else:
+                    result = "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+            with _web_search_cache_lock:
+                _web_search_cache[cache_key] = (time.time(), result)
+            return result
         except Exception as e:
             return f"Error performing web search: {e}"
 
@@ -506,3 +534,4 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         else:
             answer = f"Error communicating with LLM: {err_str}"
         return {"answer": answer, "tools_used": tools_used, "source_pages": []}
+

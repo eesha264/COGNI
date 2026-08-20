@@ -6,7 +6,9 @@ import './MainChat.css';
 // Lazily loaded — react-markdown + remark/rehype plugins + katex + highlight.js
 // are heavy (pushed the bundle past 500KB) and aren't needed until an AI message
 // actually needs rendering, so they're split into their own chunk instead of
-// always being part of the initial bundle (e.g. for the empty state).
+// always being part of the initial bundle (e.g. for the empty state). M4's
+// className restriction and C16's code-block-aware LaTeX normalization both
+// live inside MarkdownRenderer.jsx now, not inline here.
 const MarkdownRenderer = lazy(() => import('./MarkdownRenderer'));
 
 const formatTimestamp = (ts) => {
@@ -28,6 +30,8 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   // collision-safe IDs across tabs. Fall back to Date.now()+counter+random
   // for older browsers. The old makeId used Date.now()+counter only, which
   // could collide across browser tabs opened in the same millisecond.
+  // M6 fix: wrapped in useCallback so it's stable and can be safely used in
+  // useEffect dependency arrays without stale-closure risk.
   const makeId = useCallback(() => {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
       return `msg-${crypto.randomUUID()}`;
@@ -65,13 +69,33 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   const handleCopy = (content, id) => {
     // navigator.clipboard is undefined in non-secure contexts (plain HTTP on a
-    // non-localhost origin) — without this check that throws a TypeError instead
-    // of failing gracefully like a rejected clipboard write does.
-    if (!navigator.clipboard) {
-      showCopyState(id, 'failed');
-      return;
-    }
-    navigator.clipboard.writeText(content)
+    // non-localhost origin), and refuses to run outside a secure context even
+    // when the object exists on some browsers. M10 fix: fall back to a
+    // temporary textarea + execCommand so copying still works there, instead
+    // of just failing gracefully.
+    const copyToClipboard = (text) => {
+      if (navigator.clipboard && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+        return navigator.clipboard.writeText(text);
+      }
+      return new Promise((resolve, reject) => {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          resolve();
+        } catch (e) {
+          reject(e);
+        } finally {
+          document.body.removeChild(textarea);
+        }
+      });
+    };
+
+    copyToClipboard(content)
       .then(() => showCopyState(id, 'success'))
       .catch(() => showCopyState(id, 'failed'));
   };
@@ -104,10 +128,15 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
       fetch(`${API_BASE_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
         .then(res => res.json())
         .then(data => {
-          // Derive a stable id from the message's own timestamp (falling back to a
-          // fresh one only if it's missing) instead of always calling makeId() —
-          // otherwise reloading the same chat regenerates every id, causing React
-          // to remount every bubble (losing copy-button state, re-running KaTeX).
+          // M7 fix: derive a stable id from the message's own timestamp
+          // (falling back to a fresh one only if it's missing) instead of
+          // always calling makeId() — otherwise reloading the same chat
+          // regenerates every id, causing React to remount every bubble
+          // (losing copy-button state, re-running KaTeX). Uses timestamp
+          // rather than an m.id field because database.py's add_message
+          // never stores a per-message id — only role/content/timestamp —
+          // so an `m.id || makeId()` check would always miss and defeat
+          // the point of this fix on every single reload.
           setMessages((data.messages || []).map((m, idx) => ({
             ...m,
             id: m.timestamp ? `hist-${m.timestamp}-${idx}` : makeId(),
@@ -148,10 +177,12 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
       });
 
       if (!response.ok) {
+        // M5 fix: don't assume the error response is JSON — the server may
+        // return plain text or HTML (e.g. a proxy error page).
         let message = `Failed to get AI response (server returned ${response.status})`;
         try {
           const err = await response.json();
-          message = err.detail || message;
+          message = err.detail || err.message || message;
         } catch {
           // Response body wasn't JSON (e.g. a proxy's HTML error page) — keep the generic message
         }
@@ -266,9 +297,10 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
       <div className="chat-input-container">
         <div className="input-wrapper">
+          {/* M16 fix: use a textarea so Shift+Enter creates a newline and
+              Enter sends. The old single-line input couldn't do multi-line. */}
           <textarea
             ref={textareaRef}
-            rows={1}
             placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document... (Shift+Enter for a new line)"}
             className="chat-input"
             value={inputValue}
@@ -280,6 +312,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
               }
             }}
             disabled={isUploading}
+            rows={1}
           />
           <button className="send-btn" onClick={handleSend} disabled={isUploading || isAiTyping}>➤</button>
         </div>
@@ -290,3 +323,4 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 }
 
 export default MainChat;
+

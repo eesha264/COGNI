@@ -2,6 +2,8 @@ import React from 'react';
 import './LeftSidebar.css';
 
 function LeftSidebar({ onOpenSettings, onNewChat, chats, activeChatId, onSelectChat, onDeleteChat, isCollapsed, onToggleCollapse }) {
+  // M8 fix: wire up the collapse button — state is lifted to App.jsx (not
+  // local) so other layout decisions there can react to it later if needed.
   if (isCollapsed) {
     return (
       <div className="left-sidebar collapsed">

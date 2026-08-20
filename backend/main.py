@@ -1,6 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
@@ -94,17 +93,18 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         manager.disconnect(websocket, device_id)
 
-def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None):
+def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None, loop=None):
     # H1 fix: capture the running event loop once at entry instead of calling
     # the deprecated asyncio.get_event_loop() inside every callback (which can
     # also deadlock if it picks up a non-running loop). Since this function is
     # launched via BackgroundTasks (which runs on the event loop thread), we
     # capture the loop here and always use run_coroutine_threadsafe.
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
     # Callback to send websocket updates
     def update_status(step_name: str):
@@ -184,8 +184,9 @@ async def upload_pdf(
     # H2 fix: run the heavy sync PDF processing in a separate thread instead of
     # BackgroundTasks (which runs on the event loop thread and blocks all other
     # requests during PyMuPDF parsing, ONNX embedding, and Chroma writes).
-    asyncio.get_running_loop().run_in_executor(
-        None, run_pdf_processing, file_location, device_id, groq_api_key, document_id
+    main_loop = asyncio.get_running_loop()
+    main_loop.run_in_executor(
+        None, run_pdf_processing, file_location, device_id, groq_api_key, document_id, main_loop
     )
 
     # Create a chat record immediately for the uploaded document
@@ -199,9 +200,10 @@ async def upload_pdf(
     }
 
 @app.get("/chats/{device_id}")
-async def get_recent_chats(device_id: str, limit: int = Query(100, ge=1, le=500)):
-    chats = await database.get_chats(device_id, limit=limit)
-    return {"chats": chats}
+async def get_recent_chats(device_id: str, page: int = 1, per_page: int = 50):
+    # M14 fix: pass pagination params to get_chats
+    result = await database.get_chats(device_id, page=page, per_page=per_page)
+    return result
 
 @app.get("/chat/{chat_id}")
 async def get_chat_history(chat_id: str, device_id: str = None):
@@ -272,20 +274,9 @@ async def chat(
     return response
 
 # --- Serve React Frontend ---
+# M15 fix: check for dist/ at request time instead of import time, so building
+# the frontend after starting the server still works without a restart.
 frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../frontend/dist")
-frontend_assets = os.path.join(frontend_dist, "assets")
-
-# Ensure the directory exists (even empty) rather than relying on check_dir=False
-# alone: Starlette's per-request StaticFiles lookup gracefully 404s a missing FILE
-# within an existing directory, but throws an unhandled OSError (-> 500) if the
-# base directory itself is entirely absent. Creating it eagerly means requests to
-# /assets/* correctly 404 instead of 500 before a build exists, and — combined
-# with check_dir=False skipping the old construction-time-only crash — the routes
-# also start actually serving files immediately once `npm run build` runs, with
-# no server restart needed (unlike the old import-time-only os.path.exists check).
-os.makedirs(frontend_assets, exist_ok=True)
-app.mount("/assets", StaticFiles(directory=frontend_assets, check_dir=False), name="assets")
-
 
 @app.get("/")
 async def serve_react_app_root():
@@ -302,6 +293,17 @@ async def serve_react_app(catchall: str):
     # known API prefixes instead of serving index.html.
     if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
         raise HTTPException(status_code=404, detail="Not found")
+
+    # M15 fix: check for dist/ at request time, not import time, so building
+    # after starting the server still works without a restart. Serves any
+    # real file under dist/ directly (not just /assets/*) — Vite copies
+    # frontend/public/* (e.g. favicon.svg) to the dist root, not under
+    # assets/, so a request for those needs this same fallthrough rather
+    # than a dedicated StaticFiles mount scoped to /assets only.
+    file_path = os.path.join(frontend_dist, catchall)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path)
+
     index_path = os.path.join(frontend_dist, "index.html")
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="Frontend build not found. Run `npm run build` in the frontend directory.")

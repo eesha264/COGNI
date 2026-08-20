@@ -92,13 +92,23 @@ async def add_message(chat_id: str, role: str, content: str, tools_used=None, so
     except Exception as e:
         logger.error(f"Error adding message to DB: {e}")
 
-async def get_chats(device_id: str, limit: int = 100):
+async def get_chats(device_id: str, page: int = 1, per_page: int = 50):
+    """Get paginated chat list for a device.
+    M14 fix: added page/per_page parameters instead of a hard 100-chat ceiling.
+    Returns a dict with chats, page, per_page, and has_more for frontend pagination.
+    """
     if chats_collection is None:
-        return []
+        return {"chats": [], "page": page, "per_page": per_page, "has_more": False}
 
-    cursor = chats_collection.find({"device_id": device_id}).sort("created_at", -1)
-    chats = await cursor.to_list(length=limit)
-    
+    skip = (page - 1) * per_page
+    cursor = chats_collection.find({"device_id": device_id}).sort("created_at", -1).skip(skip).limit(per_page + 1)
+    chats = await cursor.to_list(length=per_page + 1)
+
+    has_more = len(chats) > per_page
+    if has_more:
+        chats = chats[:per_page]
+
+
     result = []
     for c in chats:
         result.append({
@@ -106,7 +116,7 @@ async def get_chats(device_id: str, limit: int = 100):
             "title": c.get("title", "New Chat"),
             "created_at": c.get("created_at").isoformat() if c.get("created_at") else None
         })
-    return result
+    return {"chats": result, "page": page, "per_page": per_page, "has_more": has_more}
 
 async def get_chat_history(chat_id: str, device_id: str = None):
     if chats_collection is None:
