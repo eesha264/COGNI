@@ -11,19 +11,6 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey, onLogout }) {
     onClose();
   };
 
-  // M9 fix: call onLogout prop instead of reloading the page, so in-flight
-  // uploads and chat state aren't jarringly lost.
-  const handleLogout = () => {
-    localStorage.removeItem("device_id");
-    sessionStorage.removeItem("groq_api_key");
-    if (onLogout) {
-      onLogout();
-    } else {
-      window.location.reload();
-    }
-    onClose();
-  };
-
   return (
     <div className="modal-overlay">
       <div className="modal-content fade-in">
@@ -45,7 +32,7 @@ function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey, onLogout }) {
           </div>
         </div>
         <div className="modal-footer" style={{justifyContent: 'space-between'}}>
-          <button className="cancel-btn" style={{color: '#ef4444', borderColor: '#ef4444', backgroundColor: 'transparent'}} onClick={handleLogout}>Log out</button>
+          <button className="cancel-btn" style={{color: '#ef4444', borderColor: '#ef4444', backgroundColor: 'transparent'}} onClick={onLogout}>Log out</button>
           <div style={{display: 'flex', gap: '8px'}}>
             <button className="cancel-btn" onClick={onClose}>Cancel</button>
             <button className="save-btn" onClick={handleSave}>Save</button>

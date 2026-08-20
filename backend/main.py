@@ -1,6 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
@@ -94,17 +93,18 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         manager.disconnect(websocket, device_id)
 
-def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None):
+def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None, loop=None):
     # H1 fix: capture the running event loop once at entry instead of calling
     # the deprecated asyncio.get_event_loop() inside every callback (which can
     # also deadlock if it picks up a non-running loop). Since this function is
     # launched via BackgroundTasks (which runs on the event loop thread), we
     # capture the loop here and always use run_coroutine_threadsafe.
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
     # Callback to send websocket updates
     def update_status(step_name: str):
@@ -184,8 +184,9 @@ async def upload_pdf(
     # H2 fix: run the heavy sync PDF processing in a separate thread instead of
     # BackgroundTasks (which runs on the event loop thread and blocks all other
     # requests during PyMuPDF parsing, ONNX embedding, and Chroma writes).
-    asyncio.get_running_loop().run_in_executor(
-        None, run_pdf_processing, file_location, device_id, groq_api_key, document_id
+    main_loop = asyncio.get_running_loop()
+    main_loop.run_in_executor(
+        None, run_pdf_processing, file_location, device_id, groq_api_key, document_id, main_loop
     )
 
     # Create a chat record immediately for the uploaded document
@@ -280,9 +281,10 @@ frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../fro
 @app.get("/")
 async def serve_react_app_root():
     index_path = os.path.join(frontend_dist, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    raise HTTPException(status_code=404, detail="Frontend not built. Run 'npm run build' in frontend/.")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend build not found. Run `npm run build` in the frontend directory.")
+    return FileResponse(index_path)
+
 
 @app.get("/{catchall:path}")
 async def serve_react_app(catchall: str):
@@ -292,12 +294,17 @@ async def serve_react_app(catchall: str):
     if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
         raise HTTPException(status_code=404, detail="Not found")
 
-    # M15 fix: check for dist/ at request time
+    # M15 fix: check for dist/ at request time, not import time, so building
+    # after starting the server still works without a restart. Serves any
+    # real file under dist/ directly (not just /assets/*) — Vite copies
+    # frontend/public/* (e.g. favicon.svg) to the dist root, not under
+    # assets/, so a request for those needs this same fallthrough rather
+    # than a dedicated StaticFiles mount scoped to /assets only.
     file_path = os.path.join(frontend_dist, catchall)
     if os.path.isfile(file_path):
         return FileResponse(file_path)
 
     index_path = os.path.join(frontend_dist, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    raise HTTPException(status_code=404, detail="Frontend not built. Run 'npm run build' in frontend/.")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Frontend build not found. Run `npm run build` in the frontend directory.")
+    return FileResponse(index_path)

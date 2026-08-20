@@ -3,11 +3,16 @@ import LeftSidebar from './components/LeftSidebar';
 import MainChat from './components/MainChat';
 import RightSidebar from './components/RightSidebar';
 import SettingsModal from './components/SettingsModal';
+import { API_BASE_URL, WS_BASE_URL } from './config';
 
-// M3 fix: centralize the backend URL so it's configurable via env var instead
-// of being hardcoded in 6+ places. Vite exposes import.meta.env.VITE_API_URL.
-const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
-const WS_URL = import.meta.env.VITE_WS_URL || API_URL.replace(/^http/, 'ws');
+// crypto.randomUUID() gives 122 bits of entropy and is available in all secure
+// contexts (localhost included); fall back only if it's genuinely unavailable.
+const generateDeviceId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return 'device-' + crypto.randomUUID();
+  }
+  return 'device-' + Math.random().toString(36).slice(2, 11);
+};
 
 function App() {
   // C15 fix: store the Groq API key in sessionStorage (cleared when the tab
@@ -18,12 +23,10 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeStep, setActiveStep] = useState("");
   const [isUploading, setIsUploading] = useState(false);
-  const [deviceId] = useState(() => {
+  const [deviceId, setDeviceId] = useState(() => {
     let id = localStorage.getItem("device_id");
     if (!id) {
-      // M2 fix: use crypto.randomUUID (128-bit, collision-safe) instead of
-      // Math.random().toString(36).substr(2,9) (~46 bits, substr deprecated).
-      id = "device-" + (crypto.randomUUID?.() || Math.random().toString(36).slice(2, 11));
+      id = generateDeviceId();
       localStorage.setItem("device_id", id);
     }
     return id;
@@ -31,6 +34,7 @@ function App() {
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [resetKey, setResetKey] = useState(0);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const wsRef = useRef(null);
 
   const handleSaveApiKey = (key) => {
@@ -38,13 +42,24 @@ function App() {
     setApiKey(key);
   };
 
-  // M9 fix: in-app logout without page reload — clears state and starts fresh
+  // M9 fix: resets everything in-app instead of a full page reload — a fresh
+  // device_id, cleared api key, and an empty chat list. fetchChats() re-runs
+  // automatically since it depends on deviceId, confirming the (empty) list
+  // for the new id. Clears sessionStorage directly (not just React state) —
+  // otherwise a page refresh right after logout would re-read the old key
+  // back out of sessionStorage via the apiKey useState initializer above.
   const handleLogout = () => {
+    localStorage.removeItem("device_id");
+    sessionStorage.removeItem("groq_api_key");
+    const newDeviceId = generateDeviceId();
+    localStorage.setItem("device_id", newDeviceId);
+    setDeviceId(newDeviceId);
     setApiKey("");
-    setActiveChatId(null);
     setActiveStep("");
     setChats([]);
+    setActiveChatId(null);
     setResetKey(prev => prev + 1);
+    setIsSettingsOpen(false);
   };
 
   const startWebSocket = () => {
@@ -56,8 +71,9 @@ function App() {
       wsRef.current.close();
     }
 
-    // Connect to backend websocket (C4 fix: send device_id for scoped broadcasts)
-    const ws = new WebSocket(`${WS_URL}/ws/process?device_id=${encodeURIComponent(deviceId)}`);
+    // Connect to backend websocket (C4 fix: send device_id for scoped broadcasts —
+    // the backend now requires it and closes connections that omit it)
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/process?device_id=${encodeURIComponent(deviceId)}`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
@@ -88,7 +104,7 @@ function App() {
 
   const fetchChats = React.useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/chats/${deviceId}`);
+      const res = await fetch(`${API_BASE_URL}/chats/${deviceId}`);
       if (res.ok) {
         const data = await res.json();
         setChats(data.chats || []);
@@ -110,7 +126,8 @@ function App() {
 
   const handleDeleteChat = async (chatId) => {
     try {
-      const response = await fetch(`${API_URL}/chat/${chatId}?device_id=${encodeURIComponent(deviceId)}`, {
+      // C3 fix: pass device_id so the backend can verify ownership before deleting
+      const response = await fetch(`${API_BASE_URL}/chat/${chatId}?device_id=${encodeURIComponent(deviceId)}`, {
         method: "DELETE"
       });
 
@@ -146,7 +163,7 @@ function App() {
     }
 
     try {
-      const response = await fetch(`${API_URL}/upload`, {
+      const response = await fetch(`${API_BASE_URL}/upload`, {
         method: "POST",
         body: formData,
       });
@@ -186,6 +203,8 @@ function App() {
         activeChatId={activeChatId}
         onSelectChat={setActiveChatId}
         onDeleteChat={handleDeleteChat}
+        isCollapsed={isSidebarCollapsed}
+        onToggleCollapse={() => setIsSidebarCollapsed(prev => !prev)}
       />
       <MainChat
         apiKey={apiKey}

@@ -1,89 +1,15 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-// M3 fix: use centralized API_URL instead of hardcoded 127.0.0.1:8000
-const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeRaw from 'rehype-raw';
-import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
-import rehypeKatex from 'rehype-katex';
-import rehypeHighlight from 'rehype-highlight';
+import React, { useState, useRef, useEffect, useCallback, Suspense, lazy } from 'react';
 import { DotLottieReact } from '@lottiefiles/dotlottie-react';
-import 'highlight.js/styles/github-dark.css';
-import 'katex/dist/katex.min.css';
+import { API_BASE_URL } from '../config';
 import './MainChat.css';
 
-// AI responses sometimes contain literal HTML tags (e.g. <br> inside a table cell,
-// since markdown tables can't hold real line breaks). rehypeRaw parses that HTML;
-// rehypeSanitize then strips anything unsafe (scripts, event handlers, iframes)
-// before it's rendered, since this content comes from a model, not a trusted source.
-// The math/math-inline/math-display classes are remark-math's markers for content
-// rehypeKatex still needs to find and render after sanitizing.
-// M4 fix: restrict className to only KaTeX/math class names instead of allowing
-// any arbitrary class (which could be used for CSS-based attacks).
-const sanitizeSchema = {
-  ...defaultSchema,
-  tagNames: [...(defaultSchema.tagNames || []), 'br'],
-  attributes: {
-    ...defaultSchema.attributes,
-    div: [...(defaultSchema.attributes?.div || []), ['className', /^math|katex|table-scroll-wrapper$/]],
-    span: [...(defaultSchema.attributes?.span || []), ['className', /^math|katex$/]],
-  },
-};
-
-// remark-math only recognizes $...$ / $$...$$ delimiters, but models frequently
-// write \(...\) / \[...\] instead regardless of prompt instructions — convert
-// those to the delimiters remark-math understands before rendering.
-// C16 fix: skip fenced code blocks (```...```) and inline code spans (`...`)
-// so that source code containing \[ \] \( \) (regex, shell, LaTeX source) is
-// not mangled into math delimiters.
-const normalizeLatexDelimiters = (text) => {
-  if (!text) return text;
-
-  // Split on fenced code blocks (```...```), preserving the delimiters.
-  const fenceSplit = text.split(/(```[\s\S]*?```)/g);
-  return fenceSplit.map((segment, i) => {
-    // Odd indices (by the capture group) are fenced code blocks — leave them.
-    if (i % 2 === 1) return segment;
-
-    // For the non-code segments, also protect inline code spans (`...`).
-    const inlineSplit = segment.split(/(`[^`]*`)/g);
-    return inlineSplit.map((seg, j) => {
-      if (j % 2 === 1) return seg; // inline code — leave it
-      return seg
-        .replace(/\\\[/g, () => '$$')
-        .replace(/\\\]/g, () => '$$')
-        .replace(/\\\(/g, () => '$')
-        .replace(/\\\)/g, () => '$');
-    }).join('');
-  }).join('');
-};
-
-// Renders AI Markdown responses: headers, bold/italic, tables, ordered/unordered
-// lists, blockquotes, links, fenced code blocks with syntax highlighting, and
-// LaTeX math ($...$ inline, $$...$$ block) typeset via KaTeX.
-const renderMarkdown = (text) => {
-  if (!text) return null;
-  const normalized = normalizeLatexDelimiters(text);
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], rehypeKatex, rehypeHighlight]}
-      components={{
-        a: ({ node: _node, ...props }) => (
-          <a {...props} target="_blank" rel="noopener noreferrer" />
-        ),
-        table: ({ node: _node, ...props }) => (
-          <div className="table-scroll-wrapper">
-            <table {...props} />
-          </div>
-        ),
-      }}
-    >
-      {normalized}
-    </ReactMarkdown>
-  );
-};
+// Lazily loaded — react-markdown + remark/rehype plugins + katex + highlight.js
+// are heavy (pushed the bundle past 500KB) and aren't needed until an AI message
+// actually needs rendering, so they're split into their own chunk instead of
+// always being part of the initial bundle (e.g. for the empty state). M4's
+// className restriction and C16's code-block-aware LaTeX normalization both
+// live inside MarkdownRenderer.jsx now, not inline here.
+const MarkdownRenderer = lazy(() => import('./MarkdownRenderer'));
 
 const formatTimestamp = (ts) => {
   if (!ts) return '';
@@ -96,7 +22,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
   const [isAiTyping, setIsAiTyping] = useState(false);
-  const [copiedId, setCopiedId] = useState(null);
+  const [copyState, setCopyState] = useState(null); // { id, status: 'success' | 'failed' }
   const [showScrollButton, setShowScrollButton] = useState(false);
 
   const idCounterRef = useRef(0);
@@ -104,7 +30,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
   // collision-safe IDs across tabs. Fall back to Date.now()+counter+random
   // for older browsers. The old makeId used Date.now()+counter only, which
   // could collide across browser tabs opened in the same millisecond.
-  // M6 fix: wrap in useCallback so it's stable and can be safely used in
+  // M6 fix: wrapped in useCallback so it's stable and can be safely used in
   // useEffect dependency arrays without stale-closure risk.
   const makeId = useCallback(() => {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -115,16 +41,42 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   const chatContentRef = useRef(null);
   const bottomRef = useRef(null);
+  const textareaRef = useRef(null);
+  const MAX_TEXTAREA_HEIGHT = 160;
+
+  // Auto-grow the input as the user types multi-line messages, up to a max
+  // height, beyond which it scrolls internally instead of growing forever.
+  // Deferred to the next animation frame because measuring scrollHeight
+  // immediately (e.g. on first mount) can race the flex layout still settling,
+  // reading a near-zero width and wrapping the placeholder into dozens of lines
+  // — that bad measurement then gets locked in since this effect only re-runs
+  // on inputValue changes, not once layout stabilizes a moment later.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [inputValue]);
   const autoScrollRef = useRef(true);
 
+  const showCopyState = (id, status) => {
+    setCopyState({ id, status });
+    setTimeout(() => setCopyState((s) => (s?.id === id ? null : s)), 1500);
+  };
+
   const handleCopy = (content, id) => {
-    // M10 fix: clipboard API requires HTTPS or localhost. Fall back to a
-    // temporary textarea + execCommand for non-secure contexts.
+    // navigator.clipboard is undefined in non-secure contexts (plain HTTP on a
+    // non-localhost origin), and refuses to run outside a secure context even
+    // when the object exists on some browsers. M10 fix: fall back to a
+    // temporary textarea + execCommand so copying still works there, instead
+    // of just failing gracefully.
     const copyToClipboard = (text) => {
       if (navigator.clipboard && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
         return navigator.clipboard.writeText(text);
       }
-      // Fallback for non-secure contexts
       return new Promise((resolve, reject) => {
         const textarea = document.createElement('textarea');
         textarea.value = text;
@@ -143,10 +95,9 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
       });
     };
 
-    copyToClipboard(content).then(() => {
-      setCopiedId(id);
-      setTimeout(() => setCopiedId((current) => (current === id ? null : current)), 1500);
-    }).catch(() => {});
+    copyToClipboard(content)
+      .then(() => showCopyState(id, 'success'))
+      .catch(() => showCopyState(id, 'failed'));
   };
 
   const scrollToBottom = (behavior = 'auto') => {
@@ -174,13 +125,22 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`${API_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
+      fetch(`${API_BASE_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
         .then(res => res.json())
         .then(data => {
-          // M7 fix: only generate IDs for messages that don't already have one,
-          // so React doesn't remount every chat bubble (which loses copy state
-          // and re-runs KaTeX rendering) on every load.
-          setMessages((data.messages || []).map((m) => ({ ...m, id: m.id || makeId() })));
+          // M7 fix: derive a stable id from the message's own timestamp
+          // (falling back to a fresh one only if it's missing) instead of
+          // always calling makeId() — otherwise reloading the same chat
+          // regenerates every id, causing React to remount every bubble
+          // (losing copy-button state, re-running KaTeX). Uses timestamp
+          // rather than an m.id field because database.py's add_message
+          // never stores a per-message id — only role/content/timestamp —
+          // so an `m.id || makeId()` check would always miss and defeat
+          // the point of this fix on every single reload.
+          setMessages((data.messages || []).map((m, idx) => ({
+            ...m,
+            id: m.timestamp ? `hist-${m.timestamp}-${idx}` : makeId(),
+          })));
         })
         .catch(err => console.error("Error loading chat:", err));
     } else {
@@ -211,7 +171,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
         formData.append("chat_id", activeChatId);
       }
 
-      const response = await fetch(`${API_URL}/chat`, {
+      const response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         body: formData,
       });
@@ -219,14 +179,14 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
       if (!response.ok) {
         // M5 fix: don't assume the error response is JSON — the server may
         // return plain text or HTML (e.g. a proxy error page).
-        let errDetail;
+        let message = `Failed to get AI response (server returned ${response.status})`;
         try {
           const err = await response.json();
-          errDetail = err.detail || err.message || `Server error (${response.status})`;
+          message = err.detail || err.message || message;
         } catch {
-          errDetail = `Server error (${response.status})`;
+          // Response body wasn't JSON (e.g. a proxy's HTML error page) — keep the generic message
         }
-        throw new Error(errDetail);
+        throw new Error(message);
       }
 
       const data = await response.json();
@@ -292,15 +252,17 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
                   ) : (
                     <>
                       <button
-                        className="copy-btn"
+                        className={`copy-btn ${copyState?.id === msg.id && copyState.status === 'failed' ? 'copy-failed' : ''}`}
                         onClick={() => handleCopy(msg.content, msg.id)}
-                        title="Copy response"
+                        title={copyState?.id === msg.id && copyState.status === 'failed' ? 'Copy failed — clipboard unavailable' : 'Copy response'}
                         aria-label="Copy response"
                       >
-                        {copiedId === msg.id ? '✓' : '⧉'}
+                        {copyState?.id === msg.id ? (copyState.status === 'success' ? '✓' : '✕') : '⧉'}
                       </button>
                       <div className="markdown-render">
-                        {renderMarkdown(msg.content)}
+                        <Suspense fallback={<p>{msg.content}</p>}>
+                          <MarkdownRenderer text={msg.content} />
+                        </Suspense>
                       </div>
                       {msg.source_pages && msg.source_pages.length > 0 && (
                         <div className="source-footer">
@@ -338,7 +300,8 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
           {/* M16 fix: use a textarea so Shift+Enter creates a newline and
               Enter sends. The old single-line input couldn't do multi-line. */}
           <textarea
-            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document... (Shift+Enter for newline)"}
+            ref={textareaRef}
+            placeholder={isUploading ? "Processing PDF..." : "Ask anything about the uploaded document... (Shift+Enter for a new line)"}
             className="chat-input"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}

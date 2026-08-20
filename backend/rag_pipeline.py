@@ -13,21 +13,24 @@ from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
+from guardrails import input_rail
 
-# M13 fix: lazy-init embeddings so import time is fast and we can reconfigure.
-# Previously FastEmbedEmbeddings was initialized at import time, which:
-#  1. Downloads/loads the ONNX model on every server start (slow)
-#  2. Fails the entire import if the model dir is locked
-#  3. Prevents changing the model name at runtime
+# Embeddings are expensive to set up (FastEmbed loads/downloads a model) —
+# initialize lazily on first actual use instead of at import time, so the
+# server starts instantly and doesn't crash on import if something's wrong.
+# M13 fix: double-checked locking so concurrent requests racing to
+# initialize don't each construct their own FastEmbedEmbeddings instance.
 _embeddings = None
 _embeddings_lock = threading.Lock()
 
-def get_embeddings():
-    """Lazily initialize and cache the FastEmbed embeddings instance."""
+
+def _get_embeddings():
     global _embeddings
     if _embeddings is None:
         with _embeddings_lock:
             if _embeddings is None:
+                # FastEmbed is lightweight and runs locally without needing an API key
                 _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     return _embeddings
 
@@ -49,7 +52,7 @@ def get_vector_store(collection_name: str) -> Chroma:
         if vs is None:
             vs = Chroma(
                 collection_name=collection_name,
-                embedding_function=get_embeddings(),
+                embedding_function=_get_embeddings(),
                 persist_directory=CHROMA_PERSIST_DIR,
             )
             _vector_store_cache[collection_name] = vs
@@ -63,7 +66,7 @@ def delete_vector_store(collection_name: str) -> None:
         if vs is None:
             vs = Chroma(
                 collection_name=collection_name,
-                embedding_function=get_embeddings(),
+                embedding_function=_get_embeddings(),
                 persist_directory=CHROMA_PERSIST_DIR,
             )
         try:
@@ -71,7 +74,6 @@ def delete_vector_store(collection_name: str) -> None:
         except Exception:
             # Collection didn't exist — nothing to delete.
             pass
-
 
 # --- Tools available to the LLM (bound in query_rag via bind_tools) ---
 
@@ -121,58 +123,32 @@ def get_current_datetime() -> str:
     return now.strftime("%A, %B %d, %Y at %I:%M %p (server local time)")
 
 
-# M20 fix: simple in-memory cache for web_search to avoid burning Tavily quota
-# on repeated queries within the same conversation.
-_web_search_cache: dict[str, str] = {}
+MAX_WEB_SEARCHES_PER_CONVERSATION = 5  # web_search is created per-call in query_rag(), see there
+
+# M20 fix: cache web_search results across calls/conversations so a repeated
+# identical query doesn't burn Tavily quota. TTL-bounded rather than kept
+# forever, since "current events/prices" queries can go stale — the whole
+# point of this tool is to fetch live data, so an indefinitely-lived cache
+# would silently start returning wrong answers.
+_web_search_cache: dict[str, tuple[float, str]] = {}
 _web_search_cache_lock = threading.Lock()
 WEB_SEARCH_CACHE_TTL = 300  # 5 minutes
 
-
-@tool
-def web_search(query: str) -> str:
-    """Search the live web for information not in the uploaded document and not reliably
-    known from memory — current events, weather, prices, or any fact that could have
-    changed since training. Use this instead of guessing whenever precision matters."""
-    # M20 fix: check cache first
-    cache_key = query.lower().strip()
-    with _web_search_cache_lock:
-        cached = _web_search_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return "Error: web search is not configured (missing TAVILY_API_KEY)."
-    try:
-        client = TavilyClient(api_key=api_key)
-        response = client.search(query, max_results=3, include_answer=True)
-        if response.get("answer"):
-            result = response["answer"]
-        else:
-            results = response.get("results", [])
-            if not results:
-                result = "No web results found for that query."
-            else:
-                result = "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
-        # M20 fix: cache the result
-        with _web_search_cache_lock:
-            _web_search_cache[cache_key] = result
-        return result
-    except Exception as e:
-        return f"Error performing web search: {e}"
-
-
-AVAILABLE_TOOLS = [calculator, get_current_datetime, web_search]
+AVAILABLE_TOOLS = [calculator, get_current_datetime]
 _TOOLS_BY_NAME = {t.name: t for t in AVAILABLE_TOOLS}
 
 # A page with less than this many non-whitespace characters of embedded digital
 # text is treated as scanned/handwritten/image-only, and routed to vision instead.
 MIN_TEXT_CHARS = 20
 
-# C6 fix: use a real Groq vision-capable model. "qwen/qwen3.6-27b" does not
-# exist on Groq and always failed at runtime. Llama 4 Scout is Groq's current
-# multimodal model. Allow override via env var for future model swaps.
-VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# The C6 finding from the original review claimed "qwen/qwen3.6-27b" doesn't
+# exist on Groq and proposed replacing it with "meta-llama/llama-4-scout-17b-
+# 16e-instruct" — re-verified against Groq's live /models endpoint just before
+# this merge: qwen/qwen3.6-27b IS currently listed and working (confirmed via
+# real vision transcription tests), while the proposed replacement is NOT in
+# the current model list at all. Keeping the verified-working model; still
+# allow override via env var since Groq's vision lineup does rotate.
+VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
 
 def _extract_text_via_vision(page: "pymupdf.Page", groq_api_key: str) -> str:
@@ -288,22 +264,20 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
     finally:
         doc.close()
 
+    if callback:
+        callback("Create embeddings")
+
     # C8 fix: index into a per-document collection instead of wiping a global one.
     collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
     # Replace any previous collection for this document_id (re-upload of same doc)
     delete_vector_store(collection_name)
     vs = get_vector_store(collection_name)
 
-    # Add new chunks, tagged with their source page
-    vs.add_texts(all_chunks, metadatas=all_metadatas)
-
-    if callback:
-        callback("Create embeddings")
-
-
     if callback:
         callback("Save to Vector DB")
 
+    # Add new chunks, tagged with their source page
+    vs.add_texts(all_chunks, metadatas=all_metadatas)
 
     if callback:
         callback("Done")
@@ -324,6 +298,15 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
     if not groq_api_key:
         return {"answer": "Error: Groq API key is missing. Please add it to your environment.", "tools_used": [], "source_pages": []}
 
+    # Input rail (privacy guardrails, Phase 3): block requests whose intent is
+    # to extract or unmask sensitive data before any retrieval or LLM call
+    # happens, and redact any incidental PII in an otherwise-benign question
+    # before it's ever sent to Groq.
+    gate = input_rail(question)
+    if not gate["allowed"]:
+        return {"answer": gate["reason"], "tools_used": [], "source_pages": []}
+    question = gate["query"]
+
     # C8 fix: use the per-document collection instead of the global vector_store.
     collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
     vs = get_vector_store(collection_name)
@@ -333,6 +316,58 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
     # rather than inferred from a similarity score (scores don't reliably separate
     # relevant from irrelevant content, especially on small documents).
     source_pages_used = []
+
+    # web_search call budget for this conversation: count turns that already used
+    # it (from history) plus calls made in this turn, so one long conversation
+    # can't burn through the Tavily quota unbounded.
+    prior_search_count = sum(
+        1 for m in (history or []) if m.get("role") == "ai" and "web_search" in (m.get("tools_used") or [])
+    )
+    search_calls_this_turn = [0]
+
+    @tool
+    def web_search(query: str) -> str:
+        """Search the live web for information not in the uploaded document and not reliably
+        known from memory — current events, weather, prices, or any fact that could have
+        changed since training. Use this instead of guessing whenever precision matters."""
+        # M20 fix: serve from cache first. A cache hit doesn't touch Tavily
+        # or count against the per-conversation limit below, since no real
+        # search ran — only a live API call should consume that budget.
+        cache_key = query.lower().strip()
+        with _web_search_cache_lock:
+            cached = _web_search_cache.get(cache_key)
+            if cached is not None:
+                cached_time, cached_result = cached
+                if time.time() - cached_time < WEB_SEARCH_CACHE_TTL:
+                    return cached_result
+                del _web_search_cache[cache_key]
+
+        if prior_search_count + search_calls_this_turn[0] >= MAX_WEB_SEARCHES_PER_CONVERSATION:
+            return (
+                f"Error: web search limit reached for this conversation (max {MAX_WEB_SEARCHES_PER_CONVERSATION}). "
+                "Answer using what you already know or have already found, and tell the user "
+                "live search is unavailable for the rest of this conversation."
+            )
+        search_calls_this_turn[0] += 1
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            return "Error: web search is not configured (missing TAVILY_API_KEY)."
+        try:
+            client = TavilyClient(api_key=api_key)
+            response = client.search(query, max_results=3, include_answer=True)
+            if response.get("answer"):
+                result = response["answer"]
+            else:
+                results = response.get("results", [])
+                if not results:
+                    result = "No web results found for that query."
+                else:
+                    result = "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
+            with _web_search_cache_lock:
+                _web_search_cache[cache_key] = (time.time(), result)
+            return result
+        except Exception as e:
+            return f"Error performing web search: {e}"
 
     @tool
     def search_document(query: str) -> str:
@@ -360,12 +395,27 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         if not filtered:
             return "No sufficiently relevant content was found in the uploaded document for this query."
 
+        # Retrieval rail (privacy guardrails, Phase 4): redact high-confidence
+        # PII (emails, phone numbers, card/SSN/PAN/Aadhaar numbers) out of
+        # retrieved chunks before they're appended to the message list the
+        # model sees. This is a safety net, not the primary control — the
+        # real fix is redacting at ingestion time so these values are never
+        # embedded/stored in the first place, which is separate, larger work
+        # not yet built. Deliberately uses RAIL_ENTITIES (not the broader
+        # PERSON/LOCATION set) for the same reason discovered in Phase 3:
+        # blanket-redacting every name or place in a document chunk breaks
+        # ordinary answers that legitimately reference a named person or
+        # place in the source text (e.g. "What did John Smith conclude?").
+        # Ingestion-time redaction is the right place for that broader,
+        # name-aware coverage, using a consistent per-document token scheme
+        # instead of ad hoc redaction on every retrieval.
         parts = []
         for doc, score in filtered:
             page = doc.metadata.get("page")
             if page is not None and page not in source_pages_used:
                 source_pages_used.append(page)
-            parts.append(f"[Page {page}]\n{doc.page_content}")
+            content = redact_pii(doc.page_content, TokenStore(), entities=RAIL_ENTITIES)
+            parts.append(f"[Page {page}]\n{content}")
         return "\n\n".join(parts)
 
     system_prompt = """You are Cogni, an AI assistant integrated into a document analysis system. Your top priority is being CORRECT, not sounding confident — never state something as fact unless it is grounded in a tool result or knowledge you are genuinely confident about.
@@ -378,11 +428,16 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
 5. USE CONVERSATION HISTORY: Prior messages in this conversation (if any) are included below. Use them to understand follow-up questions, pronouns ("it", "that"), and context the user already established — don't treat every message as a brand-new, unrelated conversation.
 6. TONE: Be conversational, polite, and helpful — like a careful research partner who is upfront about the limits of what they actually know.
 7. FORMATTING: Use natural paragraphs and clear Markdown formatting (headers, bullet points, bold text) to make your response easy to read. Do NOT use Markdown tables unless the user explicitly requests one, or you are directly extracting a table from the document.
-8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\\\\[...\\\\]` or `\\\\(...\\\\)` delimiters."""
+8. MATH: For any mathematical notation (equations, fractions, integrals, exponents, etc.), use LaTeX wrapped in dollar signs — `$...$` for inline math and `$$...$$` for standalone/display equations. Do NOT use `\[...\]` or `\(...\)` delimiters."""
 
-    # H5 fix: use a current, widely-available Groq model as the default instead
-    # of "openai/gpt-oss-120b" which may be decommissioned. Allow override via env.
-    model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    # The H5 finding proposed defaulting to "llama-3.3-70b-versatile" in case
+    # openai/gpt-oss-120b gets decommissioned — re-verified against Groq's live
+    # /models endpoint just before this merge: llama-3.3-70b-versatile is NOT
+    # currently listed at all, while openai/gpt-oss-120b is (and has been used
+    # successfully throughout this project's testing). Keeping the verified-
+    # working default; GROQ_MODEL env var override (and the decommission-error
+    # handling below) already cover the "model gets deprecated later" case.
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     # Initialize Groq LLM
     llm = ChatGroq(
@@ -390,8 +445,8 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         groq_api_key=groq_api_key,
         model_name=model_name,
     )
-    call_tools = AVAILABLE_TOOLS + [search_document]
-    tools_by_name = {**_TOOLS_BY_NAME, "search_document": search_document}
+    call_tools = AVAILABLE_TOOLS + [search_document, web_search]
+    tools_by_name = {**_TOOLS_BY_NAME, "search_document": search_document, "web_search": web_search}
     llm_with_tools = llm.bind_tools(call_tools)
 
     messages = [SystemMessage(content=system_prompt)]
@@ -455,9 +510,18 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
             final_msg = llm.invoke(messages + [ai_msg])
             answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+            answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
 
-        return {"answer": ai_msg.content, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
+        # Output rail (privacy guardrails, Phase 2): scan the generated answer
+        # for PII before it ever reaches the frontend or gets written to chat
+        # history — a safety net for cases where the model reconstructs or
+        # guesses a sensitive value from context even when no raw PII was in
+        # its input. A fresh TokenStore per call is intentional here: this is
+        # a last-line redaction pass, not the reversible per-document mapping
+        # (that belongs to ingestion-time redaction, a separate piece of work).
+        answer = redact_pii(ai_msg.content, TokenStore(), entities=RAIL_ENTITIES)
+        return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
     except Exception as e:
         # Provide a clearer hint for model decommission errors
         err_str = str(e)

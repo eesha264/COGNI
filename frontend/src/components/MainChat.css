@@ -147,6 +147,13 @@
   color: var(--text-light-primary);
 }
 
+/* Stays visible (ignores hover-only opacity) so the user actually sees the
+   failure feedback, not just a silent no-op */
+.copy-btn.copy-failed {
+  opacity: 1;
+  color: #ef4444;
+}
+
 .source-footer {
   margin-top: 12px;
   padding-top: 10px;
@@ -320,7 +327,7 @@
 
 .input-wrapper {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   background-color: var(--bg-input-light);
   border-radius: 24px;
   padding: 8px 12px;
@@ -355,9 +362,13 @@
   border: none;
   background: none;
   outline: none;
-  padding: 0 16px;
+  padding: 8px 16px;
   font-family: var(--font-family);
   font-size: 15px;
+  line-height: 1.4;
+  resize: none;
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 .send-btn {
@@ -371,6 +382,7 @@
   justify-content: center;
   font-size: 18px;
   transition: all 0.2s;
+  flex-shrink: 0;
 }
 
 .send-btn:disabled {

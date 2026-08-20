@@ -108,6 +108,7 @@ async def get_chats(device_id: str, page: int = 1, per_page: int = 50):
     if has_more:
         chats = chats[:per_page]
 
+
     result = []
     for c in chats:
         result.append({

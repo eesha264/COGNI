@@ -73,17 +73,24 @@ test_m2()
 section("M3: Hardcoded URLs replaced with env-configurable API_URL")
 
 def test_m3():
+    # M3 is implemented via a dedicated frontend/src/config.js module (not
+    # local import.meta.env reads in App.jsx/MainChat.jsx directly) — both
+    # files import API_BASE_URL/WS_BASE_URL from '../config' instead, which
+    # is what actually centralizes the URL (config.js is also imported by
+    # other components, avoiding the multiple-sources-of-truth problem a
+    # per-file import.meta.env read would reintroduce).
+    config = read_file("../frontend/src/config.js")
     app = read_file("../frontend/src/App.jsx")
     main_chat = read_file("../frontend/src/components/MainChat.jsx")
-    # Strip comments
     app_code = strip_comments(app)
     chat_code = strip_comments(main_chat)
 
-    test("App.jsx defines API_URL from import.meta.env", "import.meta.env.VITE_API_URL" in app)
-    test("App.jsx defines WS_URL from import.meta.env", "import.meta.env.VITE_WS_URL" in app)
+    test("config.js defines API_BASE_URL from import.meta.env", "import.meta.env.VITE_API_BASE_URL" in config)
+    test("config.js defines WS_BASE_URL from import.meta.env", "import.meta.env.VITE_WS_BASE_URL" in config)
     test("No hardcoded 127.0.0.1:8000 in App.jsx code (except fallback default)",
          "127.0.0.1:8000" not in app_code.replace("|| 'http://127.0.0.1:8000'", ""))
-    test("MainChat.jsx defines API_URL", "import.meta.env.VITE_API_URL" in main_chat)
+    test("App.jsx imports API_BASE_URL from config", "from './config'" in app and "API_BASE_URL" in app)
+    test("MainChat.jsx imports API_BASE_URL from config", "from '../config'" in main_chat and "API_BASE_URL" in main_chat)
     test("No hardcoded 127.0.0.1:8000 in MainChat.jsx code (except fallback default + localhost check)",
          "127.0.0.1:8000" not in chat_code.replace("|| 'http://127.0.0.1:8000'", "").replace("location.hostname === '127.0.0.1'", ""))
     test("Has .env.example file", os.path.exists(os.path.join(os.path.dirname(__file__), "..", "frontend", ".env.example")))
@@ -96,7 +103,10 @@ test_m3()
 section("M4: sanitizeSchema restricted className to KaTeX/math classes")
 
 def test_m4():
-    chat = read_file("../frontend/src/components/MainChat.jsx")
+    # M18 split all markdown/sanitization logic (including M4's sanitizeSchema)
+    # out of MainChat.jsx into a lazily-loaded MarkdownRenderer.jsx component —
+    # it lives there now, not inline in MainChat.jsx.
+    chat = read_file("../frontend/src/components/MarkdownRenderer.jsx")
     test("className restricted with regex pattern", "className" in chat and "math" in chat)
     test("Uses pattern matching for allowed classes", "katex" in chat and "table-scroll-wrapper" in chat)
     test("No longer allows arbitrary className", "['className']" not in chat)
@@ -111,7 +121,11 @@ section("M5: Non-JSON error responses handled in fetch")
 def test_m5():
     chat = read_file("../frontend/src/components/MainChat.jsx")
     test("Has try/catch around response.json()", "try {" in chat and "await response.json()" in chat)
-    test("Has fallback error detail", "Server error" in chat)
+    # Wording differs from the original finding's suggested text ("Server
+    # error") but the actual requirement — a graceful, non-crashing fallback
+    # message when the error body isn't JSON — is what matters, not the
+    # exact copy.
+    test("Has fallback error detail", "Failed to get AI response" in chat)
     test("Uses response.status in fallback", "response.status" in chat)
 
 test_m5()
@@ -136,7 +150,14 @@ section("M7: Don't regenerate message IDs on every load")
 
 def test_m7():
     chat = read_file("../frontend/src/components/MainChat.jsx")
-    test("Checks m.id before generating new ID", "m.id || makeId()" in chat)
+    # `m.id || makeId()` was the original approach but is a no-op in
+    # practice: database.py's add_message never stores a per-message id
+    # field (only role/content/timestamp), so m.id is always undefined and
+    # this would regenerate every id on every load — defeating the fix.
+    # Deriving a stable id from the message's own timestamp instead is what
+    # actually prevents the remount-on-reload this fix is about.
+    test("Derives a stable id instead of always calling makeId()",
+         "m.timestamp ? " in chat and "makeId()" in chat)
 
 test_m7()
 
@@ -147,9 +168,14 @@ section("M8: Collapse button wired up in LeftSidebar")
 
 def test_m8():
     sidebar = read_file("../frontend/src/components/LeftSidebar.jsx")
+    app = read_file("../frontend/src/App.jsx")
     test("Collapse button has onClick", "onClick" in sidebar and "collapse-btn" in sidebar)
-    test("Has collapsed state", "collapsed" in sidebar)
-    test("Uses setCollapsed", "setCollapsed" in sidebar)
+    test("Has collapsed state", "isCollapsed" in sidebar)
+    # Collapse state is lifted to App.jsx (isSidebarCollapsed / onToggleCollapse)
+    # rather than local useState in LeftSidebar, so other layout decisions in
+    # the parent can react to it later if needed.
+    test("Collapse state lifted to parent (App.jsx), not local useState",
+         "isSidebarCollapsed" in app and "onToggleCollapse" in app)
 
 test_m8()
 
@@ -162,8 +188,14 @@ def test_m9():
     settings = read_file("../frontend/src/components/SettingsModal.jsx")
     app = read_file("../frontend/src/App.jsx")
     test("SettingsModal accepts onLogout prop", "onLogout" in settings)
-    test("SettingsModal calls onLogout instead of always reloading",
-         "onLogout" in settings and "window.location.reload()" in settings)
+    # The original assertion here required window.location.reload() to be
+    # PRESENT, which contradicts the test's own name ("instead of always
+    # reloading") — that reload call was origin's own fallback branch in a
+    # local handleLogout that was never even called (the button already
+    # wires directly to the onLogout prop). Removed entirely, consistent
+    # with M9's actual goal: no full page reload on logout, ever.
+    test("SettingsModal calls onLogout, no page reload anywhere",
+         "onLogout" in settings and "window.location.reload()" not in settings)
     test("App.jsx passes onLogout to SettingsModal", "onLogout={handleLogout}" in app)
     test("App.jsx has handleLogout function", "handleLogout" in app)
 
@@ -228,17 +260,21 @@ def test_m13():
     rag = read_file("rag_pipeline.py")
     # Strip comments
     code = strip_comments(rag)
-    test("Has get_embeddings function", "def get_embeddings" in rag)
+    # Kept the pre-existing _get_embeddings name (underscore-prefixed,
+    # already used by every call site in get_vector_store/delete_vector_store)
+    # rather than origin's public get_embeddings — same function either way,
+    # just avoiding a second, differently-named duplicate.
+    test("Has _get_embeddings function", "def _get_embeddings" in rag)
     test("Has _embeddings global", "_embeddings" in rag)
     test("Has _embeddings_lock", "_embeddings_lock" in rag)
-    test("No direct embeddings init at module level (uses get_embeddings())",
-         "get_embeddings()" in code)
-    # FastEmbedEmbeddings instantiation should be inside get_embeddings, not at top level
-    get_embeddings_pos = code.index("def get_embeddings")
+    test("No direct embeddings init at module level (uses _get_embeddings())",
+         "_get_embeddings()" in code)
+    # FastEmbedEmbeddings instantiation should be inside _get_embeddings, not at top level
+    get_embeddings_pos = code.index("def _get_embeddings")
     fastembed_call_pos = code.index("FastEmbedEmbeddings(")
-    test("FastEmbedEmbeddings() call is inside get_embeddings (not at top level)",
+    test("FastEmbedEmbeddings() call is inside _get_embeddings (not at top level)",
          get_embeddings_pos < fastembed_call_pos,
-         f"get_embeddings at {get_embeddings_pos}, FastEmbedEmbeddings() at {fastembed_call_pos}")
+         f"_get_embeddings at {get_embeddings_pos}, FastEmbedEmbeddings() at {fastembed_call_pos}")
 
 test_m13()
 
@@ -271,7 +307,7 @@ def test_m15():
          "if os.path.exists(frontend_dist):" not in main.split("serve_react")[0] if "serve_react" in main else True)
     test("Checks os.path.exists at request time in route handler",
          "os.path.exists(index_path)" in main)
-    test("Returns 404 when frontend not built", "Frontend not built" in main)
+    test("Returns 404 when frontend not built", "Frontend build not found" in main)
 
 test_m15()
 

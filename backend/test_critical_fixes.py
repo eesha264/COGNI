@@ -474,7 +474,10 @@ def test_c15():
     test("App.jsx no longer uses localStorage for api key",
          'localStorage.getItem("groq_api_key")' not in app and
          'localStorage.setItem("groq_api_key"' not in app)
-    test("SettingsModal removes from sessionStorage", 'sessionStorage.removeItem("groq_api_key")' in settings)
+    # M9 lifted logout out of SettingsModal into App.jsx (onLogout prop) to
+    # avoid a full page reload — sessionStorage.removeItem now lives there,
+    # not in SettingsModal.jsx.
+    test("App.jsx removes key from sessionStorage on logout", 'sessionStorage.removeItem("groq_api_key")' in app)
     test("device_id still in localStorage (not moved)", 'localStorage.getItem("device_id")' in app)
 
 test_c15()
@@ -485,7 +488,10 @@ test_c15()
 section("C16: normalizeLatexDelimiters skips code blocks")
 
 def test_c16():
-    with open(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "MainChat.jsx"), "r") as f:
+    # M18 split the markdown/KaTeX/highlight.js rendering (including
+    # normalizeLatexDelimiters) out of MainChat.jsx into its own lazily-
+    # loaded component — the logic this test checks now lives there.
+    with open(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "MarkdownRenderer.jsx"), "r") as f:
         content = f.read()
 
     test("Splits on fenced code blocks", '```' in content and 'fenceSplit' in content)
