@@ -15,6 +15,7 @@ from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
 from guardrails import input_rail
+from mcp_client_manager import get_mcp_tools
 
 # Embeddings are expensive to set up (FastEmbed loads/downloads a model) —
 # initialize lazily on first actual use instead of at import time, so the
@@ -288,7 +289,7 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 MAX_HISTORY_MESSAGES = 20  # most recent messages (~10 turns) kept for conversational context
 
 
-def query_rag(question: str, groq_api_key: str, history=None, document_id: str = None):
+async def query_rag(question: str, groq_api_key: str, history=None, document_id: str = None):
     """
     Queries the vector store and returns a response from Groq using the strict system prompt,
     conditioned on the prior conversation (if any) so follow-up questions have continuity.
@@ -445,8 +446,18 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
         groq_api_key=groq_api_key,
         model_name=model_name,
     )
-    call_tools = AVAILABLE_TOOLS + [search_document, web_search]
-    tools_by_name = {**_TOOLS_BY_NAME, "search_document": search_document, "web_search": web_search}
+    # Merge in tools from external MCP servers (loaded at startup).
+    # These are LangChain BaseTool objects from langchain-mcp-adapters.
+    # If no MCP servers are configured, get_mcp_tools() returns [] and
+    # this is a no-op — the local tools work exactly as before.
+    mcp_tools = get_mcp_tools()
+    call_tools = AVAILABLE_TOOLS + [search_document, web_search] + mcp_tools
+    tools_by_name = {
+        **_TOOLS_BY_NAME,
+        "search_document": search_document,
+        "web_search": web_search,
+        **{t.name: t for t in mcp_tools},
+    }
     llm_with_tools = llm.bind_tools(call_tools)
 
     messages = [SystemMessage(content=system_prompt)]
@@ -477,7 +488,7 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
     # Invoke, looping while the model keeps requesting tool calls (some models
     # call tools one at a time across several turns rather than all at once)
     try:
-        ai_msg = llm_with_tools.invoke(messages)
+        ai_msg = await llm_with_tools.ainvoke(messages)
 
         max_tool_rounds = 5
         rounds = 0
@@ -495,20 +506,20 @@ def query_rag(question: str, groq_api_key: str, history=None, document_id: str =
                     result = f"Error: invalid tool arguments (expected a JSON object, got {type(args).__name__})"
                 elif tool_fn:
                     try:
-                        result = tool_fn.invoke(args)
+                        result = await tool_fn.ainvoke(args)
                     except Exception as tool_err:
                         result = f"Error executing tool '{call['name']}': {tool_err}"
                 else:
                     result = f"Error: unknown tool '{call['name']}'"
                 messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-            ai_msg = llm_with_tools.invoke(messages)
+            ai_msg = await llm_with_tools.ainvoke(messages)
             rounds += 1
 
         # H10 fix: if we hit max_tool_rounds and the model is still requesting
         # tools, do a final invoke WITHOUT tools bound so it must produce a
         # text answer instead of returning an empty/tool-call-only message.
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
-            final_msg = llm.invoke(messages + [ai_msg])
+            final_msg = await llm.ainvoke(messages + [ai_msg])
             answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
             answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}

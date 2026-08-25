@@ -330,17 +330,23 @@ def test_c9():
 test_c9()
 
 # =============================================================================
-# C10: query_rag runs in thread (asyncio.to_thread)
+# C10: query_rag is async (awaited directly, not via to_thread)
 # =============================================================================
-section("C10: query_rag runs via asyncio.to_thread")
+section("C10: query_rag is async and awaited directly")
 
 def test_c10():
     with open(os.path.join(os.path.dirname(__file__), "main.py"), "r") as f:
-        content = f.read()
+        main_content = f.read()
+    with open(os.path.join(os.path.dirname(__file__), "rag_pipeline.py"), "r") as f:
+        rag_content = f.read()
 
-    test("Uses asyncio.to_thread for query_rag", "asyncio.to_thread(query_rag" in content)
-    test("Passes document_id to query_rag via to_thread",
-         "asyncio.to_thread(query_rag, message, groq_api_key, history, document_id)" in content)
+    # query_rag is now async (it may await MCP tool calls over SSE),
+    # so it's awaited directly instead of run via asyncio.to_thread.
+    test("query_rag is defined as async", "async def query_rag" in rag_content)
+    test("main.py awaits query_rag directly", "await query_rag(" in main_content)
+    test("No longer uses asyncio.to_thread for query_rag", "asyncio.to_thread(query_rag" not in main_content)
+    test("Passes document_id to query_rag",
+         "await query_rag(message, groq_api_key, history, document_id)" in main_content)
 
 test_c10()
 

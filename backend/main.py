@@ -9,6 +9,7 @@ import uuid
 from dotenv import load_dotenv
 from rag_pipeline import process_pdf, query_rag
 import database
+from mcp_client_manager import connect_mcp_servers, disconnect_mcp_servers
 
 load_dotenv()
 
@@ -18,8 +19,10 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     # Startup
     database.connect_db()
+    await connect_mcp_servers()
     yield
-    # Shutdown (nothing to clean up currently)
+    # Shutdown
+    await disconnect_mcp_servers()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -254,9 +257,9 @@ async def chat(
     if chat_id:
         await database.add_message(chat_id, "user", message)
 
-    # C10 fix: run the sync query_rag in a thread so it doesn't block the
-    # event loop while waiting on Groq.
-    result = await asyncio.to_thread(query_rag, message, groq_api_key, history, document_id)
+    # query_rag is now async (it may await MCP tool calls over SSE), so we
+    # call it directly instead of running it in a thread.
+    result = await query_rag(message, groq_api_key, history, document_id)
 
     if chat_id:
         await database.add_message(chat_id, "ai", result["answer"], result["tools_used"], result["source_pages"])

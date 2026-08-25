@@ -237,7 +237,7 @@ def test_h10():
     test("Checks if rounds >= max_tool_rounds after loop",
          "rounds >= max_tool_rounds" in rag)
     test("Does final invoke without tools bound",
-         "llm.invoke(messages" in rag)
+         "llm.ainvoke(messages" in rag)
     test("Returns meaningful message when max rounds exceeded",
          "exceeded the maximum number of tool calls" in rag)
 
@@ -255,7 +255,7 @@ def test_h11():
     test("Returns error for non-dict args",
          "invalid tool arguments" in rag)
     test("Wraps tool invocation in try/except",
-         "tool_fn.invoke(args)" in rag and "except Exception as tool_err" in rag)
+         "tool_fn.ainvoke(args)" in rag and "except Exception as tool_err" in rag)
 
 test_h11()
 
