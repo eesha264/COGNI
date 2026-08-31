@@ -1,0 +1,5 @@
+# mcp-poc uses MCP SDK v2 API (MCPServer), which is incompatible with the
+# backend's v1 pin (mcp<2.0.0 via langchain-mcp-adapters). This separate
+# requirements file lets the POC run in its own venv:
+#   python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt
+mcp>=2.0.0

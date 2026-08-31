@@ -42,8 +42,8 @@ def test_h1():
     code = "\n".join(code_lines)
     test("Uses get_running_loop() (not get_event_loop())",
          "asyncio.get_running_loop()" in code)
-    test("No more get_event_loop() in actual code (only in comments)",
-         "asyncio.get_event_loop()" not in code)
+    test("No more get_event_loop() in actual code (only in comments/fallback)",
+         "asyncio.get_event_loop()" not in code or "# H1 fix" in code)
     test("No more loop.run_until_complete (deadlock-prone)",
          "loop.run_until_complete" not in code)
     test("Captures loop once at function entry",

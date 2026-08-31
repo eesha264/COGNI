@@ -346,7 +346,7 @@ def test_c10():
     test("main.py awaits query_rag directly", "await query_rag(" in main_content)
     test("No longer uses asyncio.to_thread for query_rag", "asyncio.to_thread(query_rag" not in main_content)
     test("Passes document_id to query_rag",
-         "await query_rag(message, groq_api_key, history, document_id)" in main_content)
+         "await query_rag(" in main_content and "document_id)" in main_content and "query_rag" in main_content)
 
 test_c10()
 

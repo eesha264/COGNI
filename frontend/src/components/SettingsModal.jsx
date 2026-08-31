@@ -1,8 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import './SettingsModal.css';
 
 function SettingsModal({ isOpen, onClose, apiKey, onSaveApiKey, onLogout }) {
   const [tempKey, setTempKey] = useState(apiKey);
+
+  // M22 fix: sync tempKey with apiKey prop whenever the modal opens or
+  // apiKey changes. Previously the useState initializer only ran once, so
+  // after logout the modal still showed the old key.
+  useEffect(() => {
+    if (isOpen) {
+      setTempKey(apiKey);
+    }
+  }, [isOpen, apiKey]);
 
   if (!isOpen) return null;
 

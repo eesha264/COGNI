@@ -134,6 +134,11 @@ async def get_chat_history(chat_id: str, device_id: str = None):
             if device_id is not None and chat.get("device_id") != device_id:
                 return []
             messages = chat.get("messages", [])
+            # M14 fix: only return the most recent MAX_HISTORY messages instead
+            # of fetching the entire array for long chats.
+            MAX_HISTORY = 50
+            if len(messages) > MAX_HISTORY:
+                messages = messages[-MAX_HISTORY:]
             for m in messages:
                 if "timestamp" in m:
                     m["timestamp"] = m["timestamp"].isoformat()

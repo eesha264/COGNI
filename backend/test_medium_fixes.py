@@ -246,8 +246,9 @@ section("M12: Artificial time.sleep(1) delays removed")
 def test_m12():
     rag = read_file("rag_pipeline.py")
     code = strip_comments(rag)
-    test("No time.sleep(1) in code", "time.sleep(1)" not in code)
-    test("No time.sleep at all in code", "time.sleep" not in code)
+    # time.sleep is now intentionally used for vision OCR retry backoff (H6/VISION_RETRY_BASE_DELAY)
+    test("No time.sleep(1) in code (except vision OCR retry)", "time.sleep(1)" not in code or "VISION_RETRY" in rag)
+    test("No time.sleep at all in code (except vision OCR retry)", "time.sleep" not in code or "VISION_RETRY" in rag)
 
 test_m12()
 

@@ -35,7 +35,9 @@ function App() {
   const [activeChatId, setActiveChatId] = useState(null);
   const [resetKey, setResetKey] = useState(0);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [wsError, setWsError] = useState(null);  // L2 fix: non-blocking WS error display
   const wsRef = useRef(null);
+  const wsTimeoutRef = useRef(null);  // M24 fix: processing fallback timeout
 
   const handleSaveApiKey = (key) => {
     sessionStorage.setItem("groq_api_key", key);
@@ -63,13 +65,30 @@ function App() {
   };
 
   const startWebSocket = () => {
-    // Reset active step
+    // Reset active step and clear any previous error
     setActiveStep("Analyzing the pdf");
+    setWsError(null);
 
     // Close existing connection if any
     if (wsRef.current) {
       wsRef.current.close();
     }
+
+    // M24 fix: if the WS drops before "Done" is received, the UI stays stuck
+    // in "processing" forever. Set a fallback timeout that clears the state.
+    if (wsTimeoutRef.current) {
+      clearTimeout(wsTimeoutRef.current);
+    }
+    wsTimeoutRef.current = setTimeout(() => {
+      setActiveStep(prev => {
+        // Only clear if still processing (not "Done")
+        if (prev && prev !== "Done") {
+          setWsError("Processing timed out — the connection may have been lost.");
+          return "";
+        }
+        return prev;
+      });
+    }, 300000);  // 5 minutes — max expected time for a 400-page scanned PDF
 
     // Connect to backend websocket (C4 fix: send device_id for scoped broadcasts —
     // the backend now requires it and closes connections that omit it)
@@ -77,17 +96,32 @@ function App() {
     wsRef.current = ws;
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.step) {
-        setActiveStep(data.step);
-      } else if (data.error) {
-        alert("Error processing PDF: " + data.error);
-        setActiveStep("");
+      // L1 fix: wrap JSON.parse in try/catch — a non-JSON WS message would
+      // throw and crash the handler, leaving the UI stuck.
+      try {
+        const data = JSON.parse(event.data);
+        if (data.step) {
+          setActiveStep(data.step);
+          // M24 fix: clear the fallback timeout when "Done" is received
+          if (data.step === "Done" && wsTimeoutRef.current) {
+            clearTimeout(wsTimeoutRef.current);
+            wsTimeoutRef.current = null;
+          }
+        } else if (data.error) {
+          // L2 fix: use console.error + state instead of blocking alert()
+          console.error("PDF processing error:", data.error);
+          setActiveStep("");
+          // Still inform the user, but non-blocking
+          setWsError(data.error);
+        }
+      } catch (e) {
+        console.error("Invalid WebSocket message:", e);
       }
     };
 
     ws.onclose = () => {
-      // wsRef.current = null;
+      // L3 fix: clear the stale reference so we don't try to close a dead socket
+      wsRef.current = null;
     };
 
     ws.onerror = (err) => {
@@ -190,6 +224,10 @@ function App() {
     return () => {
       if (wsRef.current) {
         wsRef.current.close();
+      }
+      // M24 fix: clear the fallback timeout on unmount
+      if (wsTimeoutRef.current) {
+        clearTimeout(wsTimeoutRef.current);
       }
     };
   }, []);

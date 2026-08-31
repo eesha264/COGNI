@@ -74,7 +74,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
     // temporary textarea + execCommand so copying still works there, instead
     // of just failing gracefully.
     const copyToClipboard = (text) => {
-      if (navigator.clipboard && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+      if (navigator.clipboard && (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '[::1]' || location.hostname === '::1')) {
         return navigator.clipboard.writeText(text);
       }
       return new Promise((resolve, reject) => {
@@ -125,24 +125,26 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
 
   React.useEffect(() => {
     if (activeChatId) {
-      fetch(`${API_BASE_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`)
+      // M23 fix: use AbortController so a stale fetch (e.g. user switched
+      // to another chat before the first one loaded) is aborted and can't
+      // overwrite the correct chat's messages.
+      const controller = new AbortController();
+      fetch(`${API_BASE_URL}/chat/${activeChatId}?device_id=${encodeURIComponent(deviceId)}`, {
+        signal: controller.signal,
+      })
         .then(res => res.json())
         .then(data => {
-          // M7 fix: derive a stable id from the message's own timestamp
-          // (falling back to a fresh one only if it's missing) instead of
-          // always calling makeId() — otherwise reloading the same chat
-          // regenerates every id, causing React to remount every bubble
-          // (losing copy-button state, re-running KaTeX). Uses timestamp
-          // rather than an m.id field because database.py's add_message
-          // never stores a per-message id — only role/content/timestamp —
-          // so an `m.id || makeId()` check would always miss and defeat
-          // the point of this fix on every single reload.
           setMessages((data.messages || []).map((m, idx) => ({
             ...m,
             id: m.timestamp ? `hist-${m.timestamp}-${idx}` : makeId(),
           })));
         })
-        .catch(err => console.error("Error loading chat:", err));
+        .catch(err => {
+          if (err.name !== 'AbortError') {
+            console.error("Error loading chat:", err);
+          }
+        });
+      return () => controller.abort();
     } else {
       setMessages([]);
     }

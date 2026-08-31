@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 import os
 import shutil
 import asyncio
+import logging
 import uuid
 from dotenv import load_dotenv
 from rag_pipeline import process_pdf, query_rag
 import database
 from mcp_client_manager import connect_mcp_servers, disconnect_mcp_servers
+from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
 
 load_dotenv()
 
@@ -25,6 +27,11 @@ async def lifespan(app: FastAPI):
     await disconnect_mcp_servers()
 
 app = FastAPI(lifespan=lifespan)
+
+# L15 fix: add a health check endpoint for monitoring/load balancers.
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "db": database.chats_collection is not None}
 
 # C2 fix: restrict CORS to known frontend origins instead of "*" + credentials
 # (which is spec-violating and an open relay). Configure via ALLOWED_ORIGINS env
@@ -44,7 +51,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploaded_files"
+# M19 fix: use absolute paths so the working directory doesn't affect where
+# files are stored.
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(_BACKEND_DIR, "uploaded_files")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Store active websocket connections, keyed by device_id so broadcasts are
@@ -97,20 +107,27 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket, device_id)
 
 def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None, document_id: str = None, loop=None):
-    # H1 fix: capture the running event loop once at entry instead of calling
-    # the deprecated asyncio.get_event_loop() inside every callback (which can
-    # also deadlock if it picks up a non-running loop). Since this function is
-    # launched via BackgroundTasks (which runs on the event loop thread), we
-    # capture the loop here and always use run_coroutine_threadsafe.
+    # H1 fix: capture the running event loop. This function is launched via
+    # run_in_executor (a thread pool), so asyncio.get_running_loop() won't
+    # work here — we rely on the caller passing the main loop explicitly.
+    # The fallback (creating a new event loop) was broken: it was never
+    # started, so run_coroutine_threadsafe would queue coroutines that never
+    # ran, silently dropping all WS broadcasts. Now we require the loop to be
+    # passed in — if it isn't, we log a warning and skip WS updates rather
+    # than silently queuing into a dead loop.
     if loop is None:
         try:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_event_loop()
+            if not loop.is_running():
+                raise RuntimeError("no running event loop")
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            logging.warning("run_pdf_processing: no running event loop — WS updates will be skipped.")
+            loop = None
 
     # Callback to send websocket updates
     def update_status(step_name: str):
+        if loop is None:
+            return  # H1 fix: no running loop — skip WS update instead of queueing into a dead loop
         asyncio.run_coroutine_threadsafe(
             manager.broadcast({"step": step_name}, device_id=device_id), loop
         )
@@ -121,21 +138,33 @@ def run_pdf_processing(file_path: str, device_id: str, groq_api_key: str = None,
         # the return value was previously ignored, so the UI showed "Done" even
         # though nothing was indexed. Broadcast the error instead.
         if isinstance(result, dict) and result.get("error"):
-            asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"error": result["error"]}, device_id=device_id), loop
-            )
+            # M5 fix: clean up the uploaded file when processing fails so it
+            # doesn't accumulate on disk forever.
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast({"error": result["error"]}, device_id=device_id), loop
+                )
     except Exception as e:
         # Broadcast error status
         try:
-            asyncio.run_coroutine_threadsafe(
-                manager.broadcast({"error": str(e)}, device_id=device_id), loop
-            )
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast({"error": str(e)}, device_id=device_id), loop
+                )
         except Exception:
             pass
 
 # C13 fix: cap upload size (default 100 MB) to prevent disk-exhaustion DoS.
 # Configure via MAX_UPLOAD_BYTES env var.
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+# M1 fix: wrap in try/except so an invalid env value doesn't crash startup.
+try:
+    MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+except (ValueError, TypeError):
+    MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 @app.post("/upload")
 async def upload_pdf(
@@ -150,8 +179,10 @@ async def upload_pdf(
     # H13 fix: also validate content-type to catch renamed non-PDF files
     # (e.g. an .exe renamed to .pdf). Accept both application/pdf and
     # application/octet-stream (some browsers send the latter for PDFs).
+    # M15 fix: remove the empty-string acceptance — it was unreachable anyway
+    # (the `if content_type` guard already filtered it).
     content_type = file.content_type or ""
-    if content_type and content_type not in ("application/pdf", "application/octet-stream", ""):
+    if content_type and content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail=f"Invalid file type: {content_type}. Only PDF files are supported.")
 
     # C1 fix: use a UUID-based filename to prevent path traversal via crafted
@@ -179,22 +210,35 @@ async def upload_pdf(
     # C7 fix: pass the user's Groq API key to process_pdf so vision OCR works
     # even when the server admin hasn't set GROQ_API_KEY in the environment.
     groq_api_key = api_key or os.getenv("GROQ_API_KEY")
+    # M25 fix: warn if no API key — typed PDFs still work, but scanned PDFs
+    # won't get vision OCR. We don't block the upload for this.
+    if not groq_api_key:
+        pass  # process_pdf will add a note per page about missing OCR
 
     # C8 fix: generate a document_id so process_pdf indexes into a per-document
     # collection instead of wiping a global one.
     document_id = uuid.uuid4().hex
 
+    # H4 fix: create the chat record BEFORE starting PDF processing. Previously
+    # processing was launched first, so a fast /chat call could arrive before
+    # the chat record existed, failing the document_id lookup.
+    chat_id = await database.create_chat(device_id, f"Document: {file.filename}", document_id=document_id)
+
     # H2 fix: run the heavy sync PDF processing in a separate thread instead of
     # BackgroundTasks (which runs on the event loop thread and blocks all other
     # requests during PyMuPDF parsing, ONNX embedding, and Chroma writes).
+    # H8 fix: attach a done callback to the Future so exceptions in
+    # run_pdf_processing are logged instead of silently swallowed.
     main_loop = asyncio.get_running_loop()
-    main_loop.run_in_executor(
+    future = main_loop.run_in_executor(
         None, run_pdf_processing, file_location, device_id, groq_api_key, document_id, main_loop
     )
-
-    # Create a chat record immediately for the uploaded document
-    # H15 fix: database is now imported at the top of the file
-    chat_id = await database.create_chat(device_id, f"Document: {file.filename}", document_id=document_id)
+    def _log_future_error(fut):
+        try:
+            fut.result()
+        except Exception as e:
+            logging.error(f"PDF processing failed: {e}", exc_info=True)
+    future.add_done_callback(_log_future_error)
 
     return {
         "info": f"file '{file.filename}' uploaded and processing started.",
@@ -204,19 +248,29 @@ async def upload_pdf(
 
 @app.get("/chats/{device_id}")
 async def get_recent_chats(device_id: str, page: int = 1, per_page: int = 50):
-    # M14 fix: pass pagination params to get_chats
+    # M13 fix: validate pagination params to prevent negative skip() in MongoDB.
+    if page < 1:
+        page = 1
+    if per_page < 1 or per_page > 200:
+        per_page = 50
     result = await database.get_chats(device_id, page=page, per_page=per_page)
     return result
 
 @app.get("/chat/{chat_id}")
 async def get_chat_history(chat_id: str, device_id: str = None):
-    # C3 fix: pass device_id for ownership check; accept via query param
+    # C3 fix: device_id is required — without it, anyone who guesses a chat_id
+    # can read another user's history (IDOR). If omitted, return 403.
+    if not device_id:
+        raise HTTPException(status_code=403, detail="device_id is required to access chat history.")
     messages = await database.get_chat_history(chat_id, device_id=device_id)
     return {"messages": messages}
 
 @app.delete("/chat/{chat_id}")
 async def delete_chat_endpoint(chat_id: str, device_id: str = None):
-    # C3 fix: scope deletion by device_id so only the owner can delete
+    # C3 fix: device_id is required — without it, anyone who guesses a chat_id
+    # can delete another user's chat (IDOR). If omitted, return 403.
+    if not device_id:
+        raise HTTPException(status_code=403, detail="device_id is required to delete a chat.")
     success = await database.delete_chat(chat_id, device_id=device_id)
     if not success:
         raise HTTPException(status_code=404, detail="Chat not found or could not be deleted")
@@ -234,6 +288,12 @@ async def chat(
     if not groq_api_key:
         raise HTTPException(status_code=400, detail="Groq API Key is required. Please set it in the environment or pass it.")
 
+    # M9 fix: validate input length to prevent sending arbitrarily large
+    # messages to Groq and MongoDB.
+    MAX_MESSAGE_LENGTH = 10000
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Message too long (max {MAX_MESSAGE_LENGTH} characters).")
+
     # Load prior conversation turns (before adding this message) so the model
     # has continuity across the chat instead of treating every message in isolation
     # C3 fix: scope history lookup by device_id (ownership check)
@@ -243,23 +303,34 @@ async def chat(
     # queries the right per-document Chroma collection.
     document_id = await database.get_chat_document_id(chat_id, device_id=device_id) if chat_id else None
 
-    # Save user message
+    # C1/C2 fix: redact PII from the user's message BEFORE storing it in the
+    # database and BEFORE sending it to Groq. Previously user messages were
+    # stored raw and replayed as raw HumanMessages in history, so PII from
+    # earlier turns leaked to Groq on every subsequent turn — defeating the
+    # entire input_rail redaction on the current question.
+    redacted_message = redact_pii(message, TokenStore(), entities=RAIL_ENTITIES)
+
+    # H2 fix: db_available must reflect whether the database is actually
+    # reachable, not just whether chat_id was provided. For an existing chat
+    # when DB is down, chat_id is truthy but add_message silently does nothing.
+    db_available = database.chats_collection is not None
+
+    # Create chat record if this is a new conversation
     if not chat_id:
-        chat_id = await database.create_chat(device_id, message)
-
-    # H3 fix: if chat_id is None (DB unavailable), warn the user instead of
-    # silently losing messages. The chat still works for the current turn.
-    db_available = chat_id is not None
-    if not db_available:
-        # Append a notice so the user knows their history isn't being saved
-        pass  # handled below in the response
-
-    if chat_id:
-        await database.add_message(chat_id, "user", message)
+        chat_id = await database.create_chat(device_id, redacted_message)
 
     # query_rag is now async (it may await MCP tool calls over SSE), so we
     # call it directly instead of running it in a thread.
-    result = await query_rag(message, groq_api_key, history, document_id)
+    # C1 fix: pass the already-redacted message so input_rail doesn't
+    # double-redact (it will still run its extraction-intent check).
+    result = await query_rag(redacted_message, groq_api_key, history, document_id)
+
+    # H3 fix: save the user message AFTER query_rag succeeds, not before.
+    # Previously the message was saved before the LLM call, so if query_rag
+    # threw, the message was already in the DB. On retry, the same message
+    # was saved again → duplicate entries in chat history.
+    if chat_id:
+        await database.add_message(chat_id, "user", redacted_message)
 
     if chat_id:
         await database.add_message(chat_id, "ai", result["answer"], result["tools_used"], result["source_pages"])
@@ -294,7 +365,8 @@ async def serve_react_app(catchall: str):
     # H8 fix: explicitly exclude API paths so a new API route registered
     # after this catchall doesn't get silently swallowed. Return 404 for
     # known API prefixes instead of serving index.html.
-    if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc")):
+    # L7 fix: also exclude "health" and use a more maintainable tuple.
+    if catchall.startswith(("upload", "chat", "chats", "ws", "docs", "openapi", "redoc", "health")):
         raise HTTPException(status_code=404, detail="Not found")
 
     # M15 fix: check for dist/ at request time, not import time, so building
@@ -303,7 +375,12 @@ async def serve_react_app(catchall: str):
     # frontend/public/* (e.g. favicon.svg) to the dist root, not under
     # assets/, so a request for those needs this same fallthrough rather
     # than a dedicated StaticFiles mount scoped to /assets only.
-    file_path = os.path.join(frontend_dist, catchall)
+    # C5 fix: use realpath to resolve the requested path and verify it stays
+    # inside frontend_dist — prevents path traversal via ../ sequences.
+    file_path = os.path.realpath(os.path.join(frontend_dist, catchall))
+    real_frontend_dist = os.path.realpath(frontend_dist)
+    if not file_path.startswith(real_frontend_dist + os.sep) and file_path != real_frontend_dist:
+        raise HTTPException(status_code=403, detail="Access denied.")
     if os.path.isfile(file_path):
         return FileResponse(file_path)
 

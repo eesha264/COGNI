@@ -21,7 +21,10 @@ spacy==3.8.15
 # MCP client support — lets query_rag merge in tools from external MCP servers
 # (GitHub, filesystem, etc.) over SSE transport. langchain-mcp-adapters converts
 # MCP tool specs into LangChain BaseTool objects so bind_tools works unchanged.
+# H13 fix: pin mcp directly (not just transitively via langchain-mcp-adapters)
+# so a constraint change in langchain-mcp-adapters can't silently break us.
 langchain-mcp-adapters==0.3.2
+mcp>=1.24.0,<2.0.0
 # spaCy's model isn't pip-installable by name — after installing the above,
 # run: python -m spacy download en_core_web_sm (pins to spacy==3.8.15's
 # compatible model release, currently en_core_web_sm 3.8.0). en_core_web_sm

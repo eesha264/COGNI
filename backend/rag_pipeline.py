@@ -1,10 +1,12 @@
 import os
 import ast
+import asyncio
 import base64
 import operator
+import re
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 import pymupdf  # fitz
 from tavily import TavilyClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,7 +17,7 @@ from langchain_groq import ChatGroq
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
 from guardrails import input_rail
-from mcp_client_manager import get_mcp_tools
+from mcp_client_manager import get_mcp_tools, MCP_TOOL_TIMEOUT
 
 # Embeddings are expensive to set up (FastEmbed loads/downloads a model) —
 # initialize lazily on first actual use instead of at import time, so the
@@ -35,7 +37,8 @@ def _get_embeddings():
                 _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     return _embeddings
 
-CHROMA_PERSIST_DIR = "./chroma_db"
+# M19 fix: use absolute path so Chroma persists regardless of working directory.
+CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 
 # C8 fix: per-document collections instead of a single global vector_store.
 # Previously process_pdf wiped the whole collection on every upload, so only
@@ -44,6 +47,8 @@ CHROMA_PERSIST_DIR = "./chroma_db"
 # A module-level cache keeps Chroma clients cheap to reuse.
 _vector_store_cache: dict[str, Chroma] = {}
 _vector_store_lock = threading.Lock()
+# M6 fix: cap the cache size to prevent unbounded memory growth.
+_MAX_VECTOR_STORE_CACHE = 50
 
 
 def get_vector_store(collection_name: str) -> Chroma:
@@ -51,6 +56,10 @@ def get_vector_store(collection_name: str) -> Chroma:
     with _vector_store_lock:
         vs = _vector_store_cache.get(collection_name)
         if vs is None:
+            # M6 fix: evict oldest entries if cache is full.
+            if len(_vector_store_cache) >= _MAX_VECTOR_STORE_CACHE:
+                oldest_key = next(iter(_vector_store_cache))
+                _vector_store_cache.pop(oldest_key, None)
             vs = Chroma(
                 collection_name=collection_name,
                 embedding_function=_get_embeddings(),
@@ -98,6 +107,13 @@ def _safe_eval(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BIN_OPS:
+        # H5 fix: cap exponent values to prevent DoS via expressions like
+        # 2**999999999 which would hang the thread indefinitely computing
+        # an astronomically large number.
+        if isinstance(node.op, ast.Pow):
+            exp_val = _safe_eval(node.right)
+            if isinstance(exp_val, (int, float)) and exp_val > 1000:
+                raise ValueError("Exponent too large (max 1000).")
         return _ALLOWED_BIN_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY_OPS:
         return _ALLOWED_UNARY_OPS[type(node.op)](_safe_eval(node.operand))
@@ -120,11 +136,26 @@ def calculator(expression: str) -> str:
 def get_current_datetime() -> str:
     """Return the current server date and time. Use this whenever the user asks what
     today's date is, what time it is, or a question relative to "today"/"now"."""
-    now = datetime.now()
+    # M26 fix: use timezone-aware UTC instead of naive local time.
+    now = datetime.now(timezone.utc)
     return now.strftime("%A, %B %d, %Y at %I:%M %p (server local time)")
 
 
 MAX_WEB_SEARCHES_PER_CONVERSATION = 5  # web_search is created per-call in query_rag(), see there
+
+# L6 fix: reuse a single TavilyClient instead of instantiating one per call.
+_tavily_client = None
+_tavily_lock = threading.Lock()
+
+def _get_tavily_client():
+    global _tavily_client
+    if _tavily_client is None:
+        with _tavily_lock:
+            if _tavily_client is None:
+                api_key = os.getenv("TAVILY_API_KEY")
+                if api_key:
+                    _tavily_client = TavilyClient(api_key=api_key)
+    return _tavily_client
 
 # M20 fix: cache web_search results across calls/conversations so a repeated
 # identical query doesn't burn Tavily quota. TTL-bounded rather than kept
@@ -134,13 +165,42 @@ MAX_WEB_SEARCHES_PER_CONVERSATION = 5  # web_search is created per-call in query
 _web_search_cache: dict[str, tuple[float, str]] = {}
 _web_search_cache_lock = threading.Lock()
 WEB_SEARCH_CACHE_TTL = 300  # 5 minutes
+# M7 fix: cap the cache size to prevent unbounded growth.
+_MAX_WEB_SEARCH_CACHE = 100
 
 AVAILABLE_TOOLS = [calculator, get_current_datetime]
 _TOOLS_BY_NAME = {t.name: t for t in AVAILABLE_TOOLS}
 
+# L10 fix: create the text splitter once at module level instead of per
+# process_pdf call — it's stateless and thread-safe.
+_TEXT_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len,
+)
+
 # A page with less than this many non-whitespace characters of embedded digital
 # text is treated as scanned/handwritten/image-only, and routed to vision instead.
 MIN_TEXT_CHARS = 20
+
+# --- Vision OCR configuration ---
+# DPI for page rendering when sending to Groq vision. 100 (down from 150)
+# reduces image token count ~40% while remaining readable for OCR.
+VISION_DPI = int(os.getenv("VISION_DPI", "100"))
+# Number of pages to send per Groq vision call. Vision models accept multiple
+# images in one message — batching reduces API calls (and RPM pressure) by
+# this factor. Most Groq vision models support up to 3 images per request;
+# if a batch exceeds the model's limit, the code auto-falls back to
+# individual page calls (see _extract_pages_via_vision_batch).
+VISION_BATCH_SIZE = int(os.getenv("VISION_BATCH_SIZE", "3"))
+# Max retry attempts on rate-limit (429) or transient errors.
+VISION_MAX_RETRIES = int(os.getenv("VISION_MAX_RETRIES", "4"))
+# Target requests per minute — stay just under Groq's RPM limit. Free tier
+# is 30 RPM; defaulting to 28 leaves headroom. Set higher for paid tiers.
+VISION_RPM_LIMIT = int(os.getenv("VISION_RPM", "28"))
+# Base delay (seconds) for exponential backoff on 429. Doubled each retry:
+# 2s -> 4s -> 8s -> 16s.
+VISION_RETRY_BASE_DELAY = 2.0
 
 # The C6 finding from the original review claimed "qwen/qwen3.6-27b" doesn't
 # exist on Groq and proposed replacing it with "meta-llama/llama-4-scout-17b-
@@ -152,26 +212,142 @@ MIN_TEXT_CHARS = 20
 VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
 
-def _extract_text_via_vision(page: "pymupdf.Page", groq_api_key: str) -> str:
+def _extract_text_via_vision(page: "pymupdf.Page", groq_api_key: str, vision_llm=None) -> str:
     """Renders a page as an image and asks a Groq vision model to transcribe it,
-    including handwriting, and to format any tables as Markdown."""
-    try:
-        pix = page.get_pixmap(dpi=150)
-        b64_image = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    including handwriting, and to format any tables as Markdown.
 
+    Uses VISION_DPI (default 100, down from 150) to reduce image token count.
+    Retries on rate-limit (429) errors with exponential backoff. Accepts an
+    optional reused ChatGroq instance to avoid constructing one per page.
+    """
+    if vision_llm is None:
         vision_llm = ChatGroq(temperature=0, groq_api_key=groq_api_key, model_name=VISION_MODEL)
-        message = HumanMessage(content=[
-            {"type": "text", "text": (
-                "Transcribe every piece of text visible on this page exactly as written, "
-                "including any handwriting. If the page contains tables, format them as "
-                "clean Markdown tables. Output only the transcribed content — no commentary."
-            )},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
-        ])
-        response = vision_llm.invoke([message])
-        return response.content or ""
-    except Exception as e:
-        return f"[Vision extraction failed for this page: {e}]"
+
+    pix = page.get_pixmap(dpi=VISION_DPI)
+    b64_image = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+
+    message = HumanMessage(content=[
+        {"type": "text", "text": (
+            "Transcribe every piece of text visible on this page exactly as written, "
+            "including any handwriting. If the page contains tables, format them as "
+            "clean Markdown tables. Output only the transcribed content — no commentary."
+        )},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+    ])
+
+    for attempt in range(VISION_MAX_RETRIES + 1):
+        try:
+            response = vision_llm.invoke([message])
+            return response.content or ""
+        except Exception as e:
+            err_str = str(e).lower()
+            is_rate_limit = "429" in err_str or "rate limit" in err_str or "rate_limit" in err_str
+            if attempt < VISION_MAX_RETRIES:
+                if is_rate_limit:
+                    delay = VISION_RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                elif attempt == 0:
+                    time.sleep(1)
+                    continue
+                else:
+                    return f"[Vision extraction failed for this page: {e}]"
+            else:
+                return f"[Vision extraction failed for this page: {e}]"
+    return "[Vision extraction failed: max retries exceeded]"
+
+
+def _extract_pages_via_vision_batch(pages_and_nums, groq_api_key, vision_llm=None):
+    """Transcribe a batch of pages in a single Groq vision call.
+
+    Sends multiple page images in one message (vision models support this),
+    asking the model to label each page's transcription with '=== Page N ==='.
+    Reduces API calls by VISION_BATCH_SIZE compared to per-page calls.
+
+    Args:
+        pages_and_nums: list of (page_num_0indexed, page) tuples
+        groq_api_key: Groq API key
+        vision_llm: optional reused ChatGroq instance
+
+    Returns:
+        dict: {page_num_1indexed: transcribed_text}. Pages that couldn't be
+        parsed from the response get an empty string; fully failed batches
+        return an error string for every page.
+    """
+    if vision_llm is None:
+        vision_llm = ChatGroq(temperature=0, groq_api_key=groq_api_key, model_name=VISION_MODEL)
+
+    page_labels = [p[0] + 1 for p in pages_and_nums]
+
+    content_parts = [
+        {"type": "text", "text": (
+            f"Transcribe every piece of text visible on each page exactly as written, "
+            f"including any handwriting. If a page contains tables, format them as "
+            f"clean Markdown tables. There are {len(pages_and_nums)} pages. "
+            f"Label each page's transcription with '=== Page N ===' on its own line "
+            f"before that page's content (where N is the page number: {', '.join(str(l) for l in page_labels)}). "
+            f"Output only the transcribed content — no commentary."
+        )}
+    ]
+
+    for page_num, page in pages_and_nums:
+        pix = page.get_pixmap(dpi=VISION_DPI)
+        b64_image = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+        content_parts.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}}
+        )
+
+    message = HumanMessage(content=content_parts)
+
+    for attempt in range(VISION_MAX_RETRIES + 1):
+        try:
+            response = vision_llm.invoke([message])
+            raw = response.content or ""
+
+            # Parse response: split on "=== Page N ===" markers
+            results = {}
+            parts = re.split(r'===\s*Page\s*(\d+)\s*===', raw)
+            for i in range(1, len(parts), 2):
+                pnum = int(parts[i])
+                text = parts[i + 1].strip() if i + 1 < len(parts) else ""
+                results[pnum] = text
+
+            # If parsing failed (no markers), fall back to assigning all
+            # text to the first page — the retry pass will handle the rest.
+            if not results:
+                results[page_labels[0]] = raw
+
+            # Ensure every page has an entry
+            for label in page_labels:
+                if label not in results:
+                    results[label] = ""
+            return results
+        except Exception as e:
+            err_str = str(e).lower()
+            is_rate_limit = "429" in err_str or "rate limit" in err_str or "rate_limit" in err_str
+            is_too_many_images = "too many images" in err_str or "maximum.*image" in err_str
+
+            # Auto-fallback: if the model doesn't support this many images,
+            # split the batch into individual page calls instead of retrying.
+            if is_too_many_images and len(pages_and_nums) > 1:
+                individual_results = {}
+                for pn, pg in pages_and_nums:
+                    individual_results[pn + 1] = _extract_text_via_vision(
+                        pg, groq_api_key, vision_llm=vision_llm
+                    )
+                return individual_results
+
+            if attempt < VISION_MAX_RETRIES:
+                if is_rate_limit:
+                    delay = VISION_RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                elif attempt == 0:
+                    time.sleep(1)
+                    continue
+                else:
+                    return {label: f"[Vision extraction failed: {e}]" for label in page_labels}
+            else:
+                return {label: f"[Vision extraction failed: {e}]" for label in page_labels}
+    return {label: "[Vision extraction failed: max retries exceeded]" for label in page_labels}
 
 
 def process_pdf(file_path: str, callback=None, groq_api_key: str = None, document_id: str = None):
@@ -201,58 +377,114 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
         if not groq_api_key:
             groq_api_key = os.getenv("GROQ_API_KEY")
 
-        # Chunk each page separately (rather than joining all pages into one blob
-        # first) so every chunk can be tagged with its source page number — this is
-        # what lets query_rag report which pages an answer actually came from.
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-        )
-
+        # L10 fix: use the module-level text splitter instead of creating one per call.
         all_chunks = []
         all_metadatas = []
 
+        # --- Pass 1: extract digital text, identify scanned pages ---
+        # Typed PDFs have embedded text (fast, free, no API calls). Scanned
+        # or handwritten pages have little/no digital text and need Groq
+        # vision OCR. Collect all scanned pages first so we can batch them
+        # and respect Groq's rate limits instead of firing one call per page
+        # in a tight loop (which blows past RPM/TPM limits on large PDFs).
+        scanned_pages = []  # list of (page_num_0indexed, page) tuples
+        page_texts = {}     # page_num_0indexed -> extracted text
+
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-
-            # Extract embedded digital text (fast, free — works for typed PDFs)
             text = page.get_text("text")
 
-            # If almost no digital text was found, this page is likely scanned or
-            # handwritten — fall back to a Groq vision model to read it from an image.
-            # H14 fix: skip the vision call if the page has no images either
-            # (a truly blank page), to avoid wasting Groq quota on empty pages.
             if len(text.strip()) < MIN_TEXT_CHARS:
                 page_images = page.get_images()
                 if not page_images and len(text.strip()) == 0:
                     # Truly blank page — no text, no images. Skip vision entirely.
-                    text = "[Blank page]"
+                    page_texts[page_num] = "[Blank page]"
                 elif groq_api_key:
-                    text = _extract_text_via_vision(page, groq_api_key) or text
+                    # Needs vision OCR — collect for batch processing below.
+                    scanned_pages.append((page_num, page))
                 else:
-                    text += "\n[Note: this page appears to be scanned/handwritten but could not be analyzed — GROQ_API_KEY not configured]"
+                    page_texts[page_num] = text + "\n[Note: this page appears to be scanned/handwritten but could not be analyzed — GROQ_API_KEY not configured]"
+            else:
+                page_texts[page_num] = text
 
-            # Extract structured tables locally (free, no AI) for typed pages
-            table_markdown = ""
+        # --- Batch vision OCR for scanned pages ---
+        # Send VISION_BATCH_SIZE pages per Groq call (vision models accept
+        # multiple images in one message). Rate-limit between batches to
+        # stay under VISION_RPM_LIMIT. Failed pages get retried individually
+        # at the end (one image per call is more reliable for parsing).
+        if scanned_pages:
+            vision_llm = ChatGroq(temperature=0, groq_api_key=groq_api_key, model_name=VISION_MODEL)
+            failed_pages = []
+            min_delay = 60.0 / VISION_RPM_LIMIT  # seconds between API calls
+            last_request_time = 0.0
+
+            for batch_start in range(0, len(scanned_pages), VISION_BATCH_SIZE):
+                batch = scanned_pages[batch_start:batch_start + VISION_BATCH_SIZE]
+
+                # Rate limit: wait if we're sending requests too fast
+                if last_request_time > 0:
+                    elapsed = time.time() - last_request_time
+                    if elapsed < min_delay:
+                        time.sleep(min_delay - elapsed)
+
+                batch_results = _extract_pages_via_vision_batch(
+                    batch, groq_api_key, vision_llm=vision_llm
+                )
+                last_request_time = time.time()
+
+                for page_num, page in batch:
+                    page_1indexed = page_num + 1
+                    text = batch_results.get(page_1indexed)
+                    if text is None or text.startswith("[Vision extraction failed"):
+                        # Batch parsing may have failed for this page —
+                        # retry it individually below.
+                        failed_pages.append((page_num, page))
+                    else:
+                        page_texts[page_num] = text
+
+            # Retry failed pages individually (one image per call)
+            if failed_pages:
+                for page_num, page in failed_pages:
+                    if last_request_time > 0:
+                        elapsed = time.time() - last_request_time
+                        if elapsed < min_delay:
+                            time.sleep(min_delay - elapsed)
+
+                    page_texts[page_num] = _extract_text_via_vision(
+                        page, groq_api_key, vision_llm=vision_llm
+                    )
+                    last_request_time = time.time()
+
+        # --- Pass 2: tables, image metadata, chunking ---
+        for page_num in range(len(doc)):
             try:
-                found = page.find_tables()
-                if found.tables:
-                    table_markdown = "\n\n".join(t.to_markdown() for t in found.tables)
-            except Exception:
-                pass
+                page = doc.load_page(page_num)
+                text = page_texts.get(page_num, "")
 
-            # Get image metadata
-            images = page.get_images()
-            image_info = f"\n[Page {page_num+1} contains {len(images)} images]\n" if images else ""
+                # Extract structured tables locally (free, no AI) for typed pages
+                table_markdown = ""
+                try:
+                    found = page.find_tables()
+                    if found.tables:
+                        table_markdown = "\n\n".join(t.to_markdown() for t in found.tables)
+                except Exception:
+                    pass
 
-            page_content = f"--- Page {page_num+1} ---\n{text}\n{image_info}"
-            if table_markdown:
-                page_content += f"\n[Tables detected on page {page_num+1}]\n{table_markdown}\n"
+                # Get image metadata
+                images = page.get_images()
+                image_info = f"\n[Page {page_num+1} contains {len(images)} images]\n" if images else ""
 
-            page_chunks = text_splitter.split_text(page_content)
-            all_chunks.extend(page_chunks)
-            all_metadatas.extend([{"page": page_num + 1}] * len(page_chunks))
+                page_content = f"--- Page {page_num+1} ---\n{text}\n{image_info}"
+                if table_markdown:
+                    page_content += f"\n[Tables detected on page {page_num+1}]\n{table_markdown}\n"
+
+                page_chunks = _TEXT_SPLITTER.split_text(page_content)
+                all_chunks.extend(page_chunks)
+                all_metadatas.extend([{"page": page_num + 1}] * len(page_chunks))
+            except Exception as e:
+                # M17 fix: don't let one corrupted page crash entire processing.
+                all_chunks.append(f"--- Page {page_num+1} ---\n[Error processing this page: {e}]")
+                all_metadatas.append({"page": page_num + 1})
 
         if callback:
             callback("Analyze tables")
@@ -282,6 +514,12 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 
     if callback:
         callback("Done")
+
+    # M4 fix: return an error if no chunks were extracted (e.g. a fully-blank
+    # or corrupt PDF) so the frontend doesn't show "Done" while every query
+    # returns "No document uploaded."
+    if not all_chunks:
+        return {"error": "No text content could be extracted from this PDF. It may be blank or corrupt."}
 
     return {"status": "success", "chunks_processed": len(all_chunks), "document_id": document_id}
 
@@ -350,11 +588,11 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
                 "live search is unavailable for the rest of this conversation."
             )
         search_calls_this_turn[0] += 1
-        api_key = os.getenv("TAVILY_API_KEY")
-        if not api_key:
+        # L6 fix: reuse the shared TavilyClient
+        client = _get_tavily_client()
+        if client is None:
             return "Error: web search is not configured (missing TAVILY_API_KEY)."
         try:
-            client = TavilyClient(api_key=api_key)
             response = client.search(query, max_results=3, include_answer=True)
             if response.get("answer"):
                 result = response["answer"]
@@ -365,6 +603,10 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
                 else:
                     result = "\n\n".join(f"{r['title']}: {r['content']}" for r in results[:3])
             with _web_search_cache_lock:
+                # M7 fix: evict oldest entries if cache is full.
+                if len(_web_search_cache) >= _MAX_WEB_SEARCH_CACHE:
+                    oldest_key = next(iter(_web_search_cache))
+                    _web_search_cache.pop(oldest_key, None)
                 _web_search_cache[cache_key] = (time.time(), result)
             return result
         except Exception as e:
@@ -390,7 +632,11 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
             return "No document has been uploaded yet, or the document index is empty."
 
         # Filter out chunks with a high distance score (low relevance)
-        SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "1.0"))
+        # M2 fix: wrap in try/except so an invalid env value doesn't crash.
+        try:
+            SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "1.0"))
+        except (ValueError, TypeError):
+            SCORE_THRESHOLD = 1.0
         filtered = [(doc, score) for doc, score in results_with_scores if score <= SCORE_THRESHOLD]
 
         if not filtered:
@@ -413,10 +659,12 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         parts = []
         for doc, score in filtered:
             page = doc.metadata.get("page")
+            # L13 fix: handle None page numbers gracefully
+            page_label = f"[Page {page}]" if page is not None else "[Page unknown]"
             if page is not None and page not in source_pages_used:
                 source_pages_used.append(page)
             content = redact_pii(doc.page_content, TokenStore(), entities=RAIL_ENTITIES)
-            parts.append(f"[Page {page}]\n{content}")
+            parts.append(f"{page_label}\n{content}")
         return "\n\n".join(parts)
 
     system_prompt = """You are Cogni, an AI assistant integrated into a document analysis system. Your top priority is being CORRECT, not sounding confident — never state something as fact unless it is grounded in a tool result or knowledge you are genuinely confident about.
@@ -441,16 +689,23 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
     model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     # Initialize Groq LLM
+    # H6 fix: add a timeout so a hung Groq API call doesn't block the request
+    # forever. Configurable via GROQ_TIMEOUT env var (default 60s).
+    groq_timeout = float(os.getenv("GROQ_TIMEOUT", "60"))
     llm = ChatGroq(
         temperature=0,
         groq_api_key=groq_api_key,
         model_name=model_name,
+        timeout=groq_timeout,
     )
     # Merge in tools from external MCP servers (loaded at startup).
     # These are LangChain BaseTool objects from langchain-mcp-adapters.
     # If no MCP servers are configured, get_mcp_tools() returns [] and
     # this is a no-op — the local tools work exactly as before.
     mcp_tools = get_mcp_tools()
+    # H10 fix: track MCP tool names so we can apply a timeout to external
+    # tool calls without affecting local tools.
+    _mcp_tool_names = {t.name for t in mcp_tools}
     call_tools = AVAILABLE_TOOLS + [search_document, web_search] + mcp_tools
     tools_by_name = {
         **_TOOLS_BY_NAME,
@@ -464,6 +719,11 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
     for turn in (history or [])[-MAX_HISTORY_MESSAGES:]:
         role = turn.get("role")
         content = turn.get("content", "")
+        # C1 fix: redact PII from historical messages before sending to Groq.
+        # This is defense-in-depth — main.py now redacts before storing, but
+        # old messages from before that fix may still contain raw PII.
+        if role == "user" and content:
+            content = redact_pii(content, TokenStore(), entities=RAIL_ENTITIES)
         if role == "user":
             messages.append(HumanMessage(content=content))
         elif role == "ai":
@@ -495,9 +755,13 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
             messages.append(ai_msg)
             for call in ai_msg.tool_calls:
-                if call["name"] not in tools_used:
-                    tools_used.append(call["name"])
-                tool_fn = tools_by_name.get(call["name"])
+                # H7 fix: use .get() instead of [] to avoid KeyError on
+                # malformed tool call dicts from some models.
+                call_name = call.get("name", "unknown")
+                call_id = call.get("id", "unknown")
+                if call_name not in tools_used:
+                    tools_used.append(call_name)
+                tool_fn = tools_by_name.get(call_name)
                 # H11 fix: validate that call["args"] is a dict before invoking;
                 # some models return malformed args (string, None) that crash
                 # the tool function.
@@ -506,20 +770,31 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
                     result = f"Error: invalid tool arguments (expected a JSON object, got {type(args).__name__})"
                 elif tool_fn:
                     try:
-                        result = await tool_fn.ainvoke(args)
+                        # H11 fix: add timeout for MCP tool calls to prevent
+                        # a hung external server from blocking the request.
+                        if call_name in _mcp_tool_names:
+                            result = await asyncio.wait_for(
+                                tool_fn.ainvoke(args), timeout=MCP_TOOL_TIMEOUT
+                            )
+                        else:
+                            result = await tool_fn.ainvoke(args)
+                    except asyncio.TimeoutError:
+                        result = f"Error: tool '{call_name}' timed out (limit: {MCP_TOOL_TIMEOUT}s)."
                     except Exception as tool_err:
-                        result = f"Error executing tool '{call['name']}': {tool_err}"
+                        result = f"Error executing tool '{call_name}': {tool_err}"
                 else:
-                    result = f"Error: unknown tool '{call['name']}'"
-                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                    result = f"Error: unknown tool '{call_name}'"
+                messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
             ai_msg = await llm_with_tools.ainvoke(messages)
             rounds += 1
 
         # H10 fix: if we hit max_tool_rounds and the model is still requesting
         # tools, do a final invoke WITHOUT tools bound so it must produce a
         # text answer instead of returning an empty/tool-call-only message.
+        # M10 fix: don't append ai_msg (which has tool_calls but no matching
+        # ToolMessages) — just invoke with the existing messages.
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
-            final_msg = await llm.ainvoke(messages + [ai_msg])
+            final_msg = await llm.ainvoke(messages)
             answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
             answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
@@ -531,7 +806,17 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         # its input. A fresh TokenStore per call is intentional here: this is
         # a last-line redaction pass, not the reversible per-document mapping
         # (that belongs to ingestion-time redaction, a separate piece of work).
-        answer = redact_pii(ai_msg.content, TokenStore(), entities=RAIL_ENTITIES)
+        # M11 fix: handle None or list content from some models.
+        raw_answer = ai_msg.content
+        if raw_answer is None:
+            raw_answer = "(No response was generated.)"
+        elif isinstance(raw_answer, list):
+            # Some models return content as a list of content blocks
+            raw_answer = " ".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in raw_answer
+            )
+        answer = redact_pii(raw_answer, TokenStore(), entities=RAIL_ENTITIES)
         return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
     except Exception as e:
         # Provide a clearer hint for model decommission errors
