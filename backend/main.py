@@ -171,7 +171,12 @@ async def upload_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     device_id: str = Form(...),
-    api_key: str = Form(None)
+    api_key: str = Form(None),
+    # Multi-PDF fix: when the frontend uploads several files from one file-picker
+    # selection, it uploads them one request at a time but passes the chat_id
+    # returned by the first request into every subsequent one, so all the files
+    # land in the same chat instead of creating a new chat per file.
+    chat_id: str = Form(None)
 ):
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
@@ -222,7 +227,23 @@ async def upload_pdf(
     # H4 fix: create the chat record BEFORE starting PDF processing. Previously
     # processing was launched first, so a fast /chat call could arrive before
     # the chat record existed, failing the document_id lookup.
-    chat_id = await database.create_chat(device_id, f"Document: {file.filename}", document_id=document_id)
+    # Multi-PDF fix: if the caller passed an existing chat_id (uploading
+    # additional files into a chat that was just created for the first file
+    # in the same batch), attach this document to that chat instead of
+    # creating a new one. Falls back to creating a fresh chat if chat_id
+    # wasn't given, or wasn't valid/owned by this device.
+    attached = False
+    if chat_id:
+        MAX_DOCUMENTS_PER_CHAT = 5
+        existing_docs = await database.get_chat_documents(chat_id, device_id=device_id)
+        if len(existing_docs) >= MAX_DOCUMENTS_PER_CHAT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"This chat already has the maximum of {MAX_DOCUMENTS_PER_CHAT} documents. Please start a new chat."
+            )
+        attached = await database.add_document_to_chat(chat_id, device_id, document_id, file.filename)
+    if not attached:
+        chat_id = await database.create_chat(device_id, f"Document: {file.filename}", document_id=document_id, document_name=file.filename)
 
     # H2 fix: run the heavy sync PDF processing in a separate thread instead of
     # BackgroundTasks (which runs on the event loop thread and blocks all other
@@ -281,12 +302,19 @@ async def chat(
     message: str = Form(...),
     api_key: str = Form(None),
     device_id: str = Form(...),
-    chat_id: str = Form(None)
+    chat_id: str = Form(None),
+    provider: str = Form(None)
 ):
-    # Retrieve Groq API Key from environment or request body
+    # Retrieve API Key from environment or request body.
+    # The key can be a Groq key or a Gemini key — the provider parameter
+    # (or auto-detection via GEMINI_API_KEY env var) decides which to use.
     groq_api_key = api_key or os.getenv("GROQ_API_KEY")
-    if not groq_api_key:
-        raise HTTPException(status_code=400, detail="Groq API Key is required. Please set it in the environment or pass it.")
+    # For Gemini, prefer the env var, but also accept the frontend-provided key
+    # if it looks like a Gemini key (starts with "AIza").
+    if not os.getenv("GEMINI_API_KEY") and api_key and api_key.startswith("AIza"):
+        os.environ["GEMINI_API_KEY"] = api_key
+    if not groq_api_key and not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=400, detail="An API Key is required (Groq or Gemini). Please set it in the environment or pass it.")
 
     # M9 fix: validate input length to prevent sending arbitrarily large
     # messages to Groq and MongoDB.
@@ -299,9 +327,14 @@ async def chat(
     # C3 fix: scope history lookup by device_id (ownership check)
     history = await database.get_chat_history(chat_id, device_id=device_id) if chat_id else []
 
-    # C8 fix: look up the document_id associated with this chat so query_rag
-    # queries the right per-document Chroma collection.
-    document_id = await database.get_chat_document_id(chat_id, device_id=device_id) if chat_id else None
+    # C8 fix: look up the document(s) associated with this chat so query_rag
+    # queries the right per-document Chroma collection(s).
+    # Multi-PDF fix: a chat can now have more than one document attached
+    # (uploaded together in one batch) — get_chat_documents returns all of
+    # them, and query_rag searches across every one when answering.
+    documents = await database.get_chat_documents(chat_id, device_id=device_id) if chat_id else []
+    document_ids = [d["document_id"] for d in documents if d.get("document_id")]
+    document_names = {d["document_id"]: d["filename"] for d in documents if d.get("document_id") and d.get("filename")}
 
     # C1/C2 fix: redact PII from the user's message BEFORE storing it in the
     # database and BEFORE sending it to Groq. Previously user messages were
@@ -323,7 +356,9 @@ async def chat(
     # call it directly instead of running it in a thread.
     # C1 fix: pass the already-redacted message so input_rail doesn't
     # double-redact (it will still run its extraction-intent check).
-    result = await query_rag(redacted_message, groq_api_key, history, document_id)
+    # Multi-PDF fix: pass document_ids (list) and document_names (dict) so
+    # query_rag can search across all attached documents.
+    result = await query_rag(redacted_message, groq_api_key, history, document_ids, document_names, provider=provider)
 
     # H3 fix: save the user message AFTER query_rag succeeds, not before.
     # Previously the message was saved before the LLM call, so if query_rag
@@ -340,6 +375,7 @@ async def chat(
         "chat_id": chat_id,
         "tools_used": result["tools_used"],
         "source_pages": result["source_pages"],
+        "provider": result.get("provider", provider or "unknown"),
     }
     # H3 fix: warn the frontend when chat history isn't being persisted so the
     # user knows their messages won't survive a page refresh.

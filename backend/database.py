@@ -32,7 +32,7 @@ def connect_db():
     db = client.cogni_db
     chats_collection = db.chats
 
-async def create_chat(device_id: str, initial_message: str, document_id: str = None):
+async def create_chat(device_id: str, initial_message: str, document_id: str = None, document_name: str = None):
     if chats_collection is None:
         return None
 
@@ -44,14 +44,48 @@ async def create_chat(device_id: str, initial_message: str, document_id: str = N
     }
     # C8 fix: store document_id on the chat so query_rag can find the right
     # per-document Chroma collection later.
+    #
+    # Multi-PDF fix: also store a "documents" list — [{"document_id", "filename"}] —
+    # so a chat can later have more PDFs attached to it (see add_document_to_chat).
+    # "document_id" is kept as-is for backward compatibility with existing chats
+    # and any code that still reads the single field.
     if document_id:
         chat_doc["document_id"] = document_id
+        chat_doc["documents"] = [{"document_id": document_id, "filename": document_name}]
     result = await chats_collection.insert_one(chat_doc)
     return str(result.inserted_id)
 
 
+async def add_document_to_chat(chat_id: str, device_id: str, document_id: str, filename: str = None):
+    """Attach another uploaded PDF to an existing chat (multi-PDF upload —
+    the user selects several files at once and they should all be queryable
+    together in the same chat). Returns True on success, False if the chat
+    doesn't exist or isn't owned by device_id."""
+    if chats_collection is None:
+        return False
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return False
+    try:
+        chat = await chats_collection.find_one({"_id": oid})
+        if not chat:
+            return False
+        if device_id is not None and chat.get("device_id") != device_id:
+            return False
+        result = await chats_collection.update_one(
+            {"_id": oid},
+            {"$push": {"documents": {"document_id": document_id, "filename": filename}}}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        logger.error(f"Error adding document to chat: {e}")
+        return False
+
+
 async def get_chat_document_id(chat_id: str, device_id: str = None):
-    """Return the document_id associated with a chat (for per-doc RAG lookup)."""
+    """Return the document_id associated with a chat (for per-doc RAG lookup).
+    Kept for backward compatibility — get_chat_documents() is the multi-PDF
+    aware replacement used by /chat now."""
     if chats_collection is None:
         return None
     # H4 fix: validate chat_id before constructing ObjectId
@@ -67,6 +101,34 @@ async def get_chat_document_id(chat_id: str, device_id: str = None):
     except Exception:
         pass
     return None
+
+
+async def get_chat_documents(chat_id: str, device_id: str = None):
+    """Return all documents attached to a chat as a list of
+    {"document_id": ..., "filename": ...} dicts — supports the multi-PDF
+    upload flow where several files are linked to one chat. Falls back to
+    the single "document_id" field for chats created before this existed."""
+    if chats_collection is None:
+        return []
+    oid = _to_objectid(chat_id)
+    if oid is None:
+        return []
+    try:
+        chat = await chats_collection.find_one({"_id": oid})
+        if not chat:
+            return []
+        if device_id is not None and chat.get("device_id") != device_id:
+            return []
+        documents = chat.get("documents")
+        if documents:
+            return documents
+        # Older chats only have a single "document_id" field.
+        legacy_id = chat.get("document_id")
+        if legacy_id:
+            return [{"document_id": legacy_id, "filename": None}]
+    except Exception:
+        pass
+    return []
 
 async def add_message(chat_id: str, role: str, content: str, tools_used=None, source_pages=None):
     if chats_collection is None:

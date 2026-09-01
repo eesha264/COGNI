@@ -14,6 +14,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from pii_guard import redact as redact_pii, RAIL_ENTITIES, TokenStore
 from guardrails import input_rail
@@ -512,6 +513,21 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
     # Add new chunks, tagged with their source page
     vs.add_texts(all_chunks, metadatas=all_metadatas)
 
+    # Phase 2: Extract tables into SQLite for structured queries.
+    # This runs in parallel with the text RAG path — text chunks go to
+    # ChromaDB (for qualitative questions), table rows go to SQLite (for
+    # data/comparison/aggregation questions). The LLM picks which tool to
+    # use based on the question type.
+    if callback:
+        callback("Extracting tables")
+    try:
+        import table_store
+        table_store.extract_and_store_tables(file_path, document_id)
+    except Exception as e:
+        # Table extraction failure shouldn't fail the whole upload —
+        # text RAG still works, just no structured queries for this doc.
+        print(f"[table_store] Warning: table extraction failed for {document_id}: {e}", flush=True)
+
     if callback:
         callback("Done")
 
@@ -527,12 +543,93 @@ def process_pdf(file_path: str, callback=None, groq_api_key: str = None, documen
 MAX_HISTORY_MESSAGES = 20  # most recent messages (~10 turns) kept for conversational context
 
 
-async def query_rag(question: str, groq_api_key: str, history=None, document_id: str = None):
+def _can_failover(err_str: str) -> bool:
+    """Check if an error is worth retrying on the fallback provider.
+    Returns True for rate limits, server errors, and tool-calling issues.
+    Returns False for decommissioned models (switching providers won't help
+    — the user needs to update their model config)."""
+    err_lower = err_str.lower()
+    # Don't failover on decommission errors — the user needs to fix their config
+    if "decommissioned" in err_lower or "model_decommissioned" in err_lower:
+        return False
+    # Failover on rate limits, server errors, tool calling issues, etc.
+    failover_keywords = [
+        "429", "rate limit", "resource_exhausted", "quota",
+        "500", "503", "server error", "timeout",
+        "tool choice", "e1041", "invalid_request", "invalid_argument",
+        "api key not valid", "api_key_invalid", "unauthorized",
+        "request too large", "tokens per minute", "tpm",
+    ]
+    return any(kw in err_lower for kw in failover_keywords)
+
+
+# --- Phase 4: Retry/backoff helpers ---
+# Module-level retry counter to prevent retry storms across concurrent calls.
+# Each query_rag call gets at most 1 same-provider retry before failover.
+_retry_count = [0]
+
+
+def _is_rate_limit(err_str: str) -> bool:
+    """Check if the error is a rate-limit error (worth retrying after a wait)."""
+    err_lower = err_str.lower()
+    return any(kw in err_lower for kw in ["429", "rate limit", "resource_exhausted", "quota"])
+
+
+def _extract_retry_seconds(err_str: str) -> int:
+    """Extract the retry delay from a rate-limit error message.
+    Gemini returns 'retry in 5s' or 'retryDelay': '5s'.
+    Groq returns 'please try again in 375ms'.
+    Returns the delay in seconds (rounded up), or 0 if not found."""
+    import re
+    # Look for patterns like "retry in 5s", "retry in 59.6s", "retryDelay': '5s'"
+    match = re.search(r'retry[^0-9]*(\d+(?:\.\d+)?)\s*s', err_str, re.IGNORECASE)
+    if match:
+        return int(float(match.group(1))) + 1
+    # Look for milliseconds: "try again in 375ms"
+    match = re.search(r'try again in (\d+)\s*ms', err_str, re.IGNORECASE)
+    if match:
+        return int(int(match.group(1)) / 1000) + 1
+    return 0
+
+
+# --- Phase 3: Smart routing ---
+# Keywords that indicate a question needs table tools (and therefore the
+# provider with reliable tool calling — Gemini). Questions without these
+# keywords are routed to Groq for speed.
+_TABLE_KEYWORDS = [
+    "compare", "comparison", "vs", "versus", "difference", "differ",
+    "total", "sum", "cost", "price", "amount", "calculate",
+    "count", "how many", "number of", "quantity",
+    "average", "avg", "mean", "min", "max", "minimum", "maximum",
+    "aggregate", "join", "cross-reference", "rate", "budget",
+    "all items", "list all", "every item", "unique to",
+    "has but", "does not have", "doesn't have", "not in",
+    "more than", "less than", "greater than", "cheaper", "expensive",
+]
+
+
+def _needs_table_tools(question: str, document_ids: list) -> bool:
+    """Heuristic: does this question need table tools (join, compare, aggregate)?
+    If so, route to Gemini which handles multi-tool sequences reliably.
+    If not, route to Groq which is faster for simple Q&A."""
+    if not document_ids:
+        return False
+    q_lower = question.lower()
+    return any(kw in q_lower for kw in _TABLE_KEYWORDS)
+
+
+async def query_rag(question: str, groq_api_key: str, history=None, document_ids=None, document_names: dict = None, provider: str = None):
     """
-    Queries the vector store and returns a response from Groq using the strict system prompt,
+    Queries the vector store and returns a response from the LLM using the strict system prompt,
     conditioned on the prior conversation (if any) so follow-up questions have continuity.
     Returns a dict: {"answer": str, "tools_used": [str], "source_pages": [int]}.
     C8 fix: queries the per-document collection identified by document_id.
+    Multi-PDF fix: document_ids may be a list — a chat can have more than one
+    PDF attached (uploaded together in one batch), and search_document below
+    searches every one of them, merging results by relevance. A single string
+    is still accepted for backward compatibility. document_names optionally
+    maps document_id -> original filename, so search results can be labeled
+    with a real filename instead of an opaque document_id.
     """
     if not groq_api_key:
         return {"answer": "Error: Groq API key is missing. Please add it to your environment.", "tools_used": [], "source_pages": []}
@@ -546,9 +643,21 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         return {"answer": gate["reason"], "tools_used": [], "source_pages": []}
     question = gate["query"]
 
-    # C8 fix: use the per-document collection instead of the global vector_store.
-    collection_name = f"pdf_{document_id}" if document_id else "pdf_default"
-    vs = get_vector_store(collection_name)
+    # C8 fix: use the per-document collection(s) instead of the global vector_store.
+    # Multi-PDF fix: normalize document_ids to a list so both single-PDF chats
+    # (old behavior) and multi-PDF chats (new behavior) are handled the same way.
+    if isinstance(document_ids, str):
+        document_ids = [document_ids]
+    doc_ids = [d for d in (document_ids or []) if d]
+    collection_names = [f"pdf_{d}" for d in doc_ids] or ["pdf_default"]
+    vector_stores = [get_vector_store(name) for name in collection_names]
+    # Label for each vector store index, used when a chunk's source needs to be
+    # attributed to a specific document in a multi-PDF chat (falls back to a
+    # generic "Document N" label if no filename was recorded for that upload).
+    doc_labels = [
+        (document_names or {}).get(d) or f"Document {i + 1}"
+        for i, d in enumerate(doc_ids)
+    ] or ["the uploaded document"]
 
     # Pages actually consulted this turn — populated only when search_document is
     # called, so the "Source: Page X" shown to the user is precise by construction
@@ -614,19 +723,30 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
 
     @tool
     def search_document(query: str) -> str:
-        """Search the uploaded document for content relevant to a query. Use this
-        whenever the user's question might be about the uploaded document — never
+        """Search the uploaded document(s) for content relevant to a query. Use this
+        whenever the user's question might be about the uploaded document(s) — never
         assume you already know its contents, and never guess at what it says
-        without searching first. Returns the most relevant excerpts, each labeled
-        with its page number."""
+        without searching first. If more than one document was uploaded, this
+        searches all of them together. Returns the most relevant excerpts, each
+        labeled with its source document and page number."""
         # H12 fix: use similarity_search_with_score and filter by a score
         # threshold so totally irrelevant chunks aren't returned (which would
         # fuel hallucination). Chroma returns L2 distance — lower is better.
         # A threshold of 1.0 is a reasonable default for bge-small-en-v1.5.
-        try:
-            results_with_scores = vs.similarity_search_with_score(query, k=4)
-        except Exception:
-            results_with_scores = []
+        #
+        # Multi-PDF fix: query every attached document's collection and merge
+        # the results by score, so a question can be answered from whichever
+        # document(s) actually contain the relevant content — the model isn't
+        # told in advance which of several uploaded PDFs holds the answer.
+        results_with_scores = []
+        for i, one_vs in enumerate(vector_stores):
+            try:
+                for doc, score in one_vs.similarity_search_with_score(query, k=4):
+                    doc.metadata["_doc_index"] = i
+                    results_with_scores.append((doc, score))
+            except Exception:
+                continue
+        results_with_scores.sort(key=lambda pair: pair[1])
 
         if not results_with_scores:
             return "No document has been uploaded yet, or the document index is empty."
@@ -637,10 +757,10 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
             SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "1.0"))
         except (ValueError, TypeError):
             SCORE_THRESHOLD = 1.0
-        filtered = [(doc, score) for doc, score in results_with_scores if score <= SCORE_THRESHOLD]
+        filtered = [(doc, score) for doc, score in results_with_scores if score <= SCORE_THRESHOLD][:4]
 
         if not filtered:
-            return "No sufficiently relevant content was found in the uploaded document for this query."
+            return "No sufficiently relevant content was found in the uploaded document(s) for this query."
 
         # Retrieval rail (privacy guardrails, Phase 4): redact high-confidence
         # PII (emails, phone numbers, card/SSN/PAN/Aadhaar numbers) out of
@@ -664,13 +784,226 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
             if page is not None and page not in source_pages_used:
                 source_pages_used.append(page)
             content = redact_pii(doc.page_content, TokenStore(), entities=RAIL_ENTITIES)
-            parts.append(f"{page_label}\n{content}")
+            doc_idx = doc.metadata.get("_doc_index", 0)
+            label = doc_labels[doc_idx] if doc_idx < len(doc_labels) else "the uploaded document"
+            # Multi-PDF fix: only prefix the source label when more than one
+            # document is attached — keeps single-PDF output identical to before.
+            if len(vector_stores) > 1:
+                parts.append(f"[{label}, Page {page}]\n{content}")
+            else:
+                parts.append(f"{page_label}\n{content}")
         return "\n\n".join(parts)
+
+    # ── Phase 2: Structured table query tools ──────────────────────────
+    # These tools query the SQLite database populated by table_store.py
+    # during process_pdf. They give the LLM exact rows from extracted
+    # tables — for comparison, aggregation, and filtered lookups that
+    # text-based search_document can't do accurately.
+    import table_store as _table_store
+    import json as _json
+    import re as _re
+
+    # Build a human-readable name for each SQLite table so the LLM never
+    # sees the raw hex document_id in table names. The raw SQLite names
+    # look like "doc_500753c082b94178959e25b6a9f37607_page_1_table_1" —
+    # useless to the LLM and ugly if it repeats them in an answer. We map
+    # them to readable labels like "Villa 101 Inventory — Page 1, Table 1"
+    # and keep a reverse map so the other table tools can translate back.
+    def _make_table_label(raw_name: str) -> str:
+        """Convert a raw SQLite table name to a human-readable label."""
+        # Parse: doc_{document_id}_page_{N}_table_{M}
+        m = _re.match(r"doc_(.+?)_page_(\d+)_table_(\d+)", raw_name)
+        if not m:
+            return raw_name
+        doc_id, page, table_idx = m.group(1), int(m.group(2)), int(m.group(3))
+        # Look up the filename for this document_id
+        filename = (document_names or {}).get(doc_id)
+        if filename:
+            # Strip extension and common prefixes for a clean label
+            label = _re.sub(r"\.(pdf|PDF)$", "", filename)
+        else:
+            # Fall back to "Document N" using the index in doc_ids
+            try:
+                idx = doc_ids.index(doc_id) + 1
+                label = f"Document {idx}"
+            except ValueError:
+                label = "Document"
+        return f"{label} — Page {page}, Table {table_idx}"
+
+    # Build the mapping once per query_rag call
+    _raw_tables = _table_store.list_tables(document_ids or [])
+    _table_label_to_raw = {}  # human-readable → raw SQLite name
+    _table_raw_to_label = {}  # raw SQLite name → human-readable
+    for rt in _raw_tables:
+        lbl = _make_table_label(rt)
+        # Ensure uniqueness — if two tables somehow produce the same label,
+        # append a suffix
+        if lbl in _table_label_to_raw:
+            lbl = f"{lbl} (2)"
+        _table_label_to_raw[lbl] = rt
+        _table_raw_to_label[rt] = lbl
+
+    def _resolve_table(name: str) -> str:
+        """Resolve a human-readable table label back to the raw SQLite name.
+        Falls back to the raw name if no mapping exists (backward compat)."""
+        return _table_label_to_raw.get(name, name)
+
+    @tool
+    def list_tables() -> str:
+        """List all structured data tables extracted from the uploaded document(s).
+        Call this first when the user asks about tabular data, inventory items,
+        quantities, rates, costs, or comparisons between documents. Returns
+        table names that can be used with describe_table, query_table,
+        compare_tables, and aggregate_column."""
+        if not _raw_tables:
+            return "No tables were extracted from the uploaded document(s). This may mean the PDFs have no detectable table structure, or table extraction failed."
+        return "Available tables:\n" + "\n".join(f"  - {lbl}" for lbl in _table_label_to_raw)
+
+    @tool
+    def describe_table(table_name: str) -> str:
+        """Describe the structure of a table — its column names, types, row count,
+        and 3 sample rows. Use this to understand what data a table contains
+        before querying it. You must call list_tables first to get valid table
+        names.
+
+        Args:
+            table_name: The table name returned by list_tables."""
+        try:
+            raw = _resolve_table(table_name)
+            desc = _table_store.describe_table(raw)
+            cols = ", ".join(f"{c['name']} ({c['type']})" for c in desc["columns"])
+            sample = "\n".join(f"  {row}" for row in desc["sample_rows"])
+            # Use the human-readable label, not the raw name
+            label = _table_raw_to_label.get(raw, table_name)
+            return f"Table: {label}\nColumns: {cols}\nRow count: {desc['row_count']}\nSample rows:\n{sample}"
+        except Exception as e:
+            return f"Error describing table '{table_name}': {e}"
+
+    @tool
+    def query_table(table_name: str, columns: str = "", where: str = "", limit: int = 50) -> str:
+        """Query rows from a structured data table. Use this for exact lookups,
+        filtered searches, or listing specific items from a table.
+
+        Args:
+            table_name: The table name from list_tables.
+            columns: Comma-separated column names to return (e.g. "code,item,qty").
+                     Leave empty to return all columns.
+            where: SQL WHERE clause without the keyword (e.g. "qty > 5" or
+                   "code = 'FLR-101'"). Leave empty for all rows.
+            limit: Max rows to return (default 50).
+
+        Returns:
+            JSON array of matching rows, or an error message."""
+        try:
+            raw = _resolve_table(table_name)
+            cols = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+            rows = _table_store.query_table(raw, columns=cols, where=where or None, limit=limit)
+            if not rows:
+                return "No rows matched the query."
+            # Format as readable text instead of raw JSON for the LLM
+            lines = []
+            for r in rows[:limit]:
+                lines.append("  " + " | ".join(f"{k}={v}" for k, v in r.items()))
+            return f"{len(rows)} row(s):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error querying table '{table_name}': {e}"
+
+    @tool
+    def compare_tables(table_a: str, table_b: str, key_column: str, mode: str = "a_not_in_b") -> str:
+        """Compare two tables to find rows that exist in one but not the other,
+        or in both. Use this for questions like "what items does document A have
+        that document B does not?" or "what items appear in both documents?".
+
+        Args:
+            table_a: First table name (from list_tables).
+            table_b: Second table name (from list_tables).
+            key_column: The column to compare on — must exist in both tables
+                        (e.g. "code", "item", "id").
+            mode: "a_not_in_b" = rows in A but not in B
+                  "b_not_in_a" = rows in B but not in A
+                  "in_both" = rows in both A and B
+
+        Returns:
+            The matching rows, or a message if none match."""
+        try:
+            raw_a = _resolve_table(table_a)
+            raw_b = _resolve_table(table_b)
+            rows = _table_store.compare_tables(raw_a, raw_b, key_column, mode)
+            if not rows:
+                return f"No rows found for mode '{mode}' on column '{key_column}'."
+            lines = []
+            for r in rows:
+                lines.append("  " + " | ".join(f"{k}={v}" for k, v in r.items()))
+            return f"{len(rows)} row(s) ({mode}):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error comparing tables: {e}"
+
+    @tool
+    def aggregate_column(table_name: str, column: str, operation: str = "sum") -> str:
+        """Aggregate a numeric column in a table. Use this for questions about
+        totals, averages, counts, min, or max of any numeric data.
+
+        Args:
+            table_name: The table name from list_tables.
+            column: The numeric column to aggregate (e.g. "qty", "amount", "rate").
+            operation: One of: sum, avg, count, min, max.
+
+        Returns:
+            The aggregation result."""
+        try:
+            raw = _resolve_table(table_name)
+            result = _table_store.aggregate_column(raw, column, operation)
+            label = _table_raw_to_label.get(raw, table_name)
+            return f"{operation}({column}) on {label} = {result['result']}"
+        except Exception as e:
+            return f"Error aggregating column '{column}': {e}"
+
+    @tool
+    def join_tables(table_a: str, table_b: str, left_key: str, right_key: str,
+                    compute: str = "", limit: int = 100) -> str:
+        """Join two tables on a shared key column. Use this when a question requires
+        data from two different documents — for example, quantities from an inventory
+        table and rates from a price schedule, joined on a shared "code" column.
+
+        Call list_tables and describe_table first to find tables with a shared
+        key column (e.g. "code", "id", "item_number").
+
+        Args:
+            table_a: Left table name (from list_tables).
+            table_b: Right table name (from list_tables).
+            left_key: Column in table_a to join on (e.g. "code").
+            right_key: Column in table_b to join on (e.g. "code").
+            compute: Optional computed column expression using prefixed column
+                     names. Columns from table_a are prefixed "a_" and columns
+                     from table_b are prefixed "b_". Example: "a_qty * b_rate_inr"
+                     to compute total cost. Leave empty for a plain join.
+            limit: Max rows to return (default 100).
+
+        Returns:
+            Joined rows with prefixed column names (a_code, b_code, etc.)
+            and optionally a "computed" column."""
+        try:
+            raw_a = _resolve_table(table_a)
+            raw_b = _resolve_table(table_b)
+            rows = _table_store.join_tables(raw_a, raw_b, left_key, right_key,
+                                             compute=compute or None, limit=limit)
+            if not rows:
+                return f"No rows matched the join (no common '{left_key}'/'{right_key}' values)."
+            lines = []
+            for r in rows[:limit]:
+                lines.append("  " + " | ".join(f"{k}={v}" for k, v in r.items()))
+            return f"{len(rows)} joined row(s):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error joining tables: {e}"
 
     system_prompt = """You are Cogni, an AI assistant integrated into a document analysis system. Your top priority is being CORRECT, not sounding confident — never state something as fact unless it is grounded in a tool result or knowledge you are genuinely confident about.
 
 [HOW TO ANSWER]
-1. DOCUMENT LOOKUP: Use the `search_document` tool whenever the question might relate to the uploaded document. Never assume you already know its contents — search first, then answer from what you find, treating it as ground truth.
+1. DOCUMENT LOOKUP: Use the `search_document` tool whenever the question might relate to the uploaded document(s). If more than one document was uploaded, `search_document` searches all of them together and labels each result with its source document — never assume you already know their contents, search first, then answer from what you find, treating it as ground truth.
+1b. STRUCTURED DATA: For questions about tabular data — inventory items, quantities, rates, costs, comparisons between documents, totals, counts, or any question that requires exact data from tables — use the table query tools instead of search_document. Call `list_tables` first to see what tables exist, then `describe_table` to understand their columns, then `query_table`, `compare_tables`, or `aggregate_column` to get exact data. These tools return precise rows from the extracted tables — never guess at tabular data when a table tool can give you the exact answer.
+1c. COMPARISON QUESTIONS: For questions like "what items does document A have that document B does not?" or "what appears in both documents?", always use `compare_tables` — never try to answer from search_document results, which only show text fragments and will give incomplete or wrong answers.
+1d. NUMERICAL QUESTIONS: For questions about totals, sums, averages, counts, min, max, or any aggregation, use `aggregate_column` — never try to sum numbers yourself from text fragments.
+1e. CROSS-DOCUMENT QUESTIONS: For questions that need data from two different documents (e.g. "what is the total cost of items in document A?" where quantities are in doc A and rates are in doc B), use `join_tables` to join the two tables on their shared key column, with a compute expression like "a_qty * b_rate_inr". Then use `aggregate_column` or `calculator` on the result if a total is needed. Always call `describe_table` on both tables first to find the shared key column and understand which columns have the data you need.
 2. USE TOOLS FOR PRECISION: For arithmetic, use `calculator`. For "today"/"now"/current date or time questions, use `get_current_datetime`. For anything current, real-time, or that could have changed since your training (weather, prices, news, live facts), use `web_search`. Never guess a number or fact a tool could give you exactly — call the tool instead.
 3. OUT-OF-DOCUMENT QUESTIONS: If `search_document` doesn't return a relevant answer and no other tool applies, you may answer from general knowledge ONLY if you are genuinely confident it is correct, and you must clearly tell the user this specific information was not found in their uploaded document. If you are not confident, say so plainly instead of guessing — never fabricate details, numbers, names, dates, or citations.
 4. STAY RELEVANT: If a question is unrelated to the document, the available tools, and anything you can answer confidently, do not invent a speculative answer. Briefly say it's outside what you can reliably help with, and ask a clarifying question if that would help.
@@ -688,16 +1021,57 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
     # handling below) already cover the "model gets deprecated later" case.
     model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-    # Initialize Groq LLM
-    # H6 fix: add a timeout so a hung Groq API call doesn't block the request
-    # forever. Configurable via GROQ_TIMEOUT env var (default 60s).
-    groq_timeout = float(os.getenv("GROQ_TIMEOUT", "60"))
-    llm = ChatGroq(
-        temperature=0,
-        groq_api_key=groq_api_key,
-        model_name=model_name,
-        timeout=groq_timeout,
-    )
+    # --- Provider selection (Phase 3: smart routing) ---
+    # If provider is explicitly specified, use it. Otherwise, auto-route:
+    # - Simple questions (no table keywords) → Groq (fast, 500 TPS)
+    # - Complex questions (compare, total, join, etc.) → Gemini (reliable tools)
+    # - If only one provider's key is available, use that one.
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    doc_ids = [d for d in (document_ids or []) if d]
+
+    if provider is None:
+        if gemini_api_key and groq_api_key:
+            # Both keys available — route by question complexity
+            provider = "gemini" if _needs_table_tools(question, doc_ids) else "groq"
+        elif gemini_api_key:
+            provider = "gemini"
+        else:
+            provider = "groq"
+
+    def _make_gemini_llm():
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        return ChatGoogleGenerativeAI(
+            temperature=0,
+            google_api_key=gemini_api_key,
+            model=gemini_model,
+        )
+
+    def _make_groq_llm():
+        # H6 fix: add a timeout so a hung Groq API call doesn't block the request
+        # forever. Configurable via GROQ_TIMEOUT env var (default 60s).
+        groq_timeout = float(os.getenv("GROQ_TIMEOUT", "60"))
+        return ChatGroq(
+            temperature=0,
+            groq_api_key=groq_api_key,
+            model_name=model_name,
+            timeout=groq_timeout,
+        )
+
+    # Build the primary LLM. If it fails during tool calling, we'll retry
+    # with the fallback provider (Phase 2 failover).
+    primary_provider = provider
+    # Phase 3: fallback works in both directions — Gemini→Groq and Groq→Gemini
+    if primary_provider == "gemini":
+        fallback_provider = "groq" if groq_api_key else None
+    elif primary_provider == "groq":
+        fallback_provider = "gemini" if gemini_api_key else None
+    else:
+        fallback_provider = None
+
+    if primary_provider == "gemini" and gemini_api_key:
+        llm = _make_gemini_llm()
+    else:
+        llm = _make_groq_llm()
     # Merge in tools from external MCP servers (loaded at startup).
     # These are LangChain BaseTool objects from langchain-mcp-adapters.
     # If no MCP servers are configured, get_mcp_tools() returns [] and
@@ -706,11 +1080,20 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
     # H10 fix: track MCP tool names so we can apply a timeout to external
     # tool calls without affecting local tools.
     _mcp_tool_names = {t.name for t in mcp_tools}
-    call_tools = AVAILABLE_TOOLS + [search_document, web_search] + mcp_tools
+    call_tools = AVAILABLE_TOOLS + [search_document, web_search,
+                                    list_tables, describe_table, query_table,
+                                    compare_tables, aggregate_column,
+                                    join_tables] + mcp_tools
     tools_by_name = {
         **_TOOLS_BY_NAME,
         "search_document": search_document,
         "web_search": web_search,
+        "list_tables": list_tables,
+        "describe_table": describe_table,
+        "query_table": query_table,
+        "compare_tables": compare_tables,
+        "aggregate_column": aggregate_column,
+        "join_tables": join_tables,
         **{t.name: t for t in mcp_tools},
     }
     llm_with_tools = llm.bind_tools(call_tools)
@@ -744,15 +1127,19 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
     messages.append(HumanMessage(content=question))
 
     tools_used = []
+    max_tool_rounds = 5
 
     # Invoke, looping while the model keeps requesting tool calls (some models
     # call tools one at a time across several turns rather than all at once)
     try:
         ai_msg = await llm_with_tools.ainvoke(messages)
 
-        max_tool_rounds = 5
         rounds = 0
         while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
+            # Gemini 3.x requires thought_signatures in function call parts.
+            # The langchain-google-genai package stores these in
+            # response_metadata — so we MUST append the original ai_msg
+            # unmodified, NOT a reconstructed AIMessage.
             messages.append(ai_msg)
             for call in ai_msg.tool_calls:
                 # H7 fix: use .get() instead of [] to avoid KeyError on
@@ -793,9 +1180,25 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         # text answer instead of returning an empty/tool-call-only message.
         # M10 fix: don't append ai_msg (which has tool_calls but no matching
         # ToolMessages) — just invoke with the existing messages.
+        # Gemini doesn't support "model prefilling" (AIMessage as the last
+        # message), so we add a HumanMessage prompting the model to answer.
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
-            final_msg = await llm.ainvoke(messages)
-            answer = final_msg.content or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+            final_msg = await llm.ainvoke(messages + [HumanMessage(
+                content="Please provide a final answer based on the tool results above. Do not call any more tools."
+            )])
+            # Normalize Gemini list content to string
+            fc = final_msg.content
+            if isinstance(fc, list):
+                parts = []
+                for part in fc:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict) and "text" in part:
+                        parts.append(part["text"])
+                    else:
+                        parts.append(str(part))
+                fc = "".join(parts) if parts else ""
+            answer = fc or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
             answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
 
@@ -807,21 +1210,173 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
         # a last-line redaction pass, not the reversible per-document mapping
         # (that belongs to ingestion-time redaction, a separate piece of work).
         # M11 fix: handle None or list content from some models.
-        raw_answer = ai_msg.content
-        if raw_answer is None:
-            raw_answer = "(No response was generated.)"
-        elif isinstance(raw_answer, list):
-            # Some models return content as a list of content blocks
-            raw_answer = " ".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in raw_answer
-            )
-        answer = redact_pii(raw_answer, TokenStore(), entities=RAIL_ENTITIES)
-        return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
+        # Gemini returns content as a list of parts — normalize to a string
+        # so downstream processing (redaction, history storage, frontend) works.
+        raw_content = ai_msg.content
+        if raw_content is None:
+            raw_content = "(No response was generated.)"
+        elif isinstance(raw_content, list):
+            parts = []
+            for part in raw_content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and "text" in part:
+                    parts.append(part["text"])
+                else:
+                    parts.append(str(part))
+            raw_content = "".join(parts) if parts else ""
+
+        answer = redact_pii(raw_content, TokenStore(), entities=RAIL_ENTITIES)
+        return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used), "provider": primary_provider}
     except Exception as e:
-        # Provide a clearer hint for model decommission errors
         err_str = str(e)
-        if "decommissioned" in err_str or "model_decommissioned" in err_str:
+
+        # --- Phase 4: Bounded retry with backoff for rate-limit errors ---
+        # If the primary provider hit a rate limit, wait briefly and retry
+        # the same provider once before failing over. This handles transient
+        # rate limits (e.g. "retry in 5s") without a full provider switch.
+        if _is_rate_limit(err_str) and _retry_count[0] < 1:
+            _retry_count[0] += 1
+            wait_secs = _extract_retry_seconds(err_str)
+            if wait_secs and wait_secs <= 30:
+                await asyncio.sleep(wait_secs)
+                try:
+                    ai_msg = await llm_with_tools.ainvoke(messages)
+                    rounds = 0
+                    while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
+                        messages.append(ai_msg)
+                        for call in ai_msg.tool_calls:
+                            if call["name"] not in tools_used:
+                                tools_used.append(call["name"])
+                            tool_fn = tools_by_name.get(call["name"])
+                            args = call.get("args")
+                            if not isinstance(args, dict):
+                                result = f"Error: invalid tool arguments"
+                            elif tool_fn:
+                                try:
+                                    result = await tool_fn.ainvoke(args)
+                                except Exception as tool_err:
+                                    result = f"Error executing tool: {tool_err}"
+                            else:
+                                result = f"Error: unknown tool"
+                            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                        ai_msg = await llm_with_tools.ainvoke(messages)
+                        rounds += 1
+                    raw_content = ai_msg.content
+                    if isinstance(raw_content, list):
+                        parts = []
+                        for part in raw_content:
+                            if isinstance(part, str):
+                                parts.append(part)
+                            elif isinstance(part, dict) and "text" in part:
+                                parts.append(part["text"])
+                            else:
+                                parts.append(str(part))
+                        raw_content = "".join(parts) if parts else ""
+                    answer = redact_pii(raw_content, TokenStore(), entities=RAIL_ENTITIES)
+                    _retry_count[0] = 0
+                    return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used), "provider": primary_provider}
+                except Exception:
+                    pass  # fall through to failover
+            _retry_count[0] = 0
+
+        # --- Phase 2: Failover to the backup provider ---
+        # If the primary provider failed (rate limit, tool error, etc.) and a
+        # fallback provider is available, retry the entire query with the
+        # fallback. This is NOT a retry of the same provider — it switches to
+        # a completely different LLM (e.g. Gemini → Groq or vice versa).
+        if fallback_provider and _can_failover(err_str):
+            try:
+                if fallback_provider == "groq" and groq_api_key:
+                    llm = _make_groq_llm()
+                elif fallback_provider == "gemini" and gemini_api_key:
+                    llm = _make_gemini_llm()
+                else:
+                    raise Exception("No fallback provider available")
+
+                llm_with_tools = llm.bind_tools(call_tools)
+                # Rebuild messages without the failed provider's partial state
+                # (tool calls from the primary may have provider-specific format)
+                retry_messages = [SystemMessage(content=system_prompt)]
+                for turn in (history or [])[-MAX_HISTORY_MESSAGES:]:
+                    role = turn.get("role")
+                    content = turn.get("content", "")
+                    if role == "user":
+                        retry_messages.append(HumanMessage(content=content))
+                    elif role == "ai" and not turn.get("tool_calls"):
+                        retry_messages.append(AIMessage(content=content))
+                retry_messages.append(HumanMessage(content=question))
+
+                ai_msg = await llm_with_tools.ainvoke(retry_messages)
+                retry_tools_used = []
+                rounds = 0
+                while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
+                    retry_messages.append(ai_msg)
+                    for call in ai_msg.tool_calls:
+                        if call["name"] not in retry_tools_used:
+                            retry_tools_used.append(call["name"])
+                        tool_fn = tools_by_name.get(call["name"])
+                        args = call.get("args")
+                        if not isinstance(args, dict):
+                            result = f"Error: invalid tool arguments"
+                        elif tool_fn:
+                            try:
+                                result = await tool_fn.ainvoke(args)
+                            except Exception as tool_err:
+                                result = f"Error executing tool: {tool_err}"
+                        else:
+                            result = f"Error: unknown tool"
+                        retry_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                    ai_msg = await llm_with_tools.ainvoke(retry_messages)
+                    rounds += 1
+
+                # H10 fix for fallback: force a final text answer if still
+                # requesting tools after max rounds.
+                if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
+                    final_msg = await llm.ainvoke(retry_messages + [HumanMessage(
+                        content="Please provide a final answer based on the tool results above. Do not call any more tools."
+                    )])
+                    ai_msg = final_msg
+
+                raw_content = ai_msg.content
+                if isinstance(raw_content, list):
+                    parts = []
+                    for part in raw_content:
+                        if isinstance(part, str):
+                            parts.append(part)
+                        elif isinstance(part, dict) and "text" in part:
+                            parts.append(part["text"])
+                        else:
+                            parts.append(str(part))
+                    raw_content = "".join(parts) if parts else ""
+
+                answer = redact_pii(raw_content, TokenStore(), entities=RAIL_ENTITIES)
+                return {"answer": answer, "tools_used": retry_tools_used, "source_pages": sorted(source_pages_used), "provider": fallback_provider}
+            except Exception as fallback_err:
+                fb_err = str(fallback_err)
+                if _is_rate_limit(fb_err):
+                    answer = (
+                        "Both AI providers are currently rate-limited. "
+                        "This is common on free tiers — please wait a minute and try again. "
+                        f"(Detail: {fb_err[:200]})"
+                    )
+                elif "api key not valid" in fb_err.lower() or "unauthorized" in fb_err.lower():
+                    answer = (
+                        "Both AI providers rejected the API key. "
+                        "Please check that valid API keys are configured for at least one provider."
+                    )
+                else:
+                    answer = f"Error communicating with LLM: {fb_err}"
+                return {"answer": answer, "tools_used": tools_used, "source_pages": [], "provider": fallback_provider}
+
+        # --- Phase 4: User-friendly error when both providers fail ---
+        if _is_rate_limit(err_str):
+            answer = (
+                "Both AI providers are currently rate-limited. "
+                "This is common on free tiers — please wait a minute and try again. "
+                f"(Detail: {err_str[:200]})"
+            )
+        elif "decommissioned" in err_str or "model_decommissioned" in err_str:
             answer = (
                 "Error communicating with LLM: the model you are using appears to be decommissioned. "
                 "Set the environment variable GROQ_MODEL to a supported model name or visit "
@@ -829,5 +1384,5 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_id:
             )
         else:
             answer = f"Error communicating with LLM: {err_str}"
-        return {"answer": answer, "tools_used": tools_used, "source_pages": []}
+        return {"answer": answer, "tools_used": tools_used, "source_pages": [], "provider": primary_provider}
 

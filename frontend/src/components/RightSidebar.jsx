@@ -51,11 +51,15 @@ function VLine({ filled, area }) {
   );
 }
 
-function RightSidebar({ activeStep = '', onFileUpload }) {
+function RightSidebar({ activeStep = '', onFileUpload, uploadBatch = { current: 0, total: 0 } }) {
   const fileInputRef = useRef(null);
 
+  // Multi-PDF fix: pass every selected file up as an array — App.jsx uploads
+  // them one at a time and links them all to the same chat.
   const handleFileChange = (e) => {
-    if (e.target.files[0]) onFileUpload(e.target.files[0]);
+    const files = Array.from(e.target.files || []);
+    if (files.length > 0) onFileUpload(files);
+    e.target.value = ""; // allow re-selecting the same file(s) again later
   };
 
   const isDone = activeStep === 'Done';
@@ -71,11 +75,11 @@ function RightSidebar({ activeStep = '', onFileUpload }) {
         <div className="upload-full">
           <div className="upload-box" onClick={() => fileInputRef.current.click()}>
             <div className="upload-icon-wrap">📄</div>
-            <p className="upload-title">Upload PDF Document</p>
-            <p className="upload-hint">Up to 400 pages</p>
+            <p className="upload-title">Upload PDF Document(s)</p>
+            <p className="upload-hint">Up to 400 pages each · max 5 files · select multiple to analyze together</p>
           </div>
           <input type="file" ref={fileInputRef}
-            style={{ display: 'none' }} accept=".pdf"
+            style={{ display: 'none' }} accept=".pdf" multiple
             onChange={handleFileChange}
           />
         </div>
@@ -84,6 +88,14 @@ function RightSidebar({ activeStep = '', onFileUpload }) {
       {/* ── STATE 2: Analysis Graph (explicit CSS grid, no reversal tricks) ── */}
       {showGraph && (
         <div className="process-graph">
+
+          {/* Multi-PDF fix: when uploading more than one file, show which
+              file in the batch is currently going through this pipeline. */}
+          {uploadBatch.total > 1 && (
+            <p className="upload-hint" style={{ textAlign: 'center', marginBottom: '8px' }}>
+              Processing file {uploadBatch.current} of {uploadBatch.total}
+            </p>
+          )}
 
           {/* ── Row 1 L→R : PDF → Images ── */}
           <div className="ga-c1r1"><StepCard label="PDF" icon="📄" status={s[0]} /></div>

@@ -300,8 +300,8 @@ def test_c8():
     test("database.create_chat accepts document_id", "document_id: str = None" in db_content)
     test("database has get_chat_document_id", "def get_chat_document_id" in db_content)
     test("main.py generates document_id", "document_id = uuid.uuid4().hex" in main_content)
-    test("main.py passes document_id to create_chat", "create_chat(device_id, f\"Document: {file.filename}\", document_id=document_id)" in main_content)
-    test("main.py looks up document_id for /chat", "get_chat_document_id" in main_content)
+    test("main.py passes document_id to create_chat", "create_chat(device_id, f\"Document: {file.filename}\", document_id=document_id, document_name=file.filename)" in main_content)
+    test("main.py looks up document(s) for /chat", "get_chat_documents" in main_content)
     test("No more delete_collection() on global store", "vector_store.delete_collection()" not in rag_content)
 
     # Functional test: verify two different document_ids produce different collection names
@@ -345,8 +345,8 @@ def test_c10():
     test("query_rag is defined as async", "async def query_rag" in rag_content)
     test("main.py awaits query_rag directly", "await query_rag(" in main_content)
     test("No longer uses asyncio.to_thread for query_rag", "asyncio.to_thread(query_rag" not in main_content)
-    test("Passes document_id to query_rag",
-         "await query_rag(" in main_content and "document_id)" in main_content and "query_rag" in main_content)
+    test("Passes document_ids to query_rag",
+         "await query_rag(" in main_content and "document_ids" in main_content and "document_names" in main_content)
 
 test_c10()
 
@@ -551,6 +551,54 @@ def test_c16():
          "$$" in output4 and r"code\[0\]" in output4)
 
 test_c16()
+
+# =============================================================================
+# M-PDF: Multi-PDF upload — several files attached to one chat
+# =============================================================================
+section("M-PDF: Multi-PDF upload (documents attached to one chat)")
+
+def test_multi_pdf():
+    with open(os.path.join(os.path.dirname(__file__), "database.py"), "r") as f:
+        db_content = f.read()
+    with open(os.path.join(os.path.dirname(__file__), "main.py"), "r") as f:
+        main_content = f.read()
+    with open(os.path.join(os.path.dirname(__file__), "rag_pipeline.py"), "r") as f:
+        rag_content = f.read()
+
+    test("database has add_document_to_chat", "async def add_document_to_chat" in db_content)
+    test("database has get_chat_documents", "async def get_chat_documents" in db_content)
+    test("create_chat stores a documents list", '"documents"' in db_content)
+    test("main.py /upload accepts an optional chat_id to attach to", "chat_id: str = Form(None)" in main_content)
+    test("main.py attaches to existing chat via add_document_to_chat", "add_document_to_chat(chat_id, device_id, document_id, file.filename)" in main_content)
+    test("query_rag accepts document_ids (list)", "async def query_rag(question: str, groq_api_key: str, history=None, document_ids=None" in rag_content)
+    test("query_rag normalizes a single string document_ids to a list", "isinstance(document_ids, str)" in rag_content)
+    test("search_document loops over all attached vector_stores", "for i, one_vs in enumerate(vector_stores):" in rag_content)
+
+    # Functional test: get_chat_documents falls back to the legacy single
+    # document_id field for chats created before multi-PDF support existed.
+    import database
+    database.chats_collection = MagicMock()
+    legacy_chat = {"_id": "x", "device_id": "dev-1", "document_id": "legacy-doc-abc"}
+
+    async def _fake_find_one(query):
+        return legacy_chat
+
+    with patch.object(database, "_to_objectid", return_value="x"):
+        database.chats_collection.find_one = _fake_find_one
+        docs = asyncio.run(database.get_chat_documents("anything", device_id="dev-1"))
+    test("get_chat_documents falls back to legacy document_id field",
+         docs == [{"document_id": "legacy-doc-abc", "filename": None}],
+         f"got {docs}")
+
+    # Functional test: add_document_to_chat / get_chat_documents both return
+    # a safe empty/False result when the DB is unavailable, instead of raising.
+    database.chats_collection = None
+    added = asyncio.run(database.add_document_to_chat("chat-1", "dev-1", "doc-2", "file2.pdf"))
+    test("add_document_to_chat returns False when DB unavailable", added is False)
+    docs_none = asyncio.run(database.get_chat_documents("chat-1", device_id="dev-1"))
+    test("get_chat_documents returns [] when DB unavailable", docs_none == [])
+
+test_multi_pdf()
 
 # =============================================================================
 # Print results

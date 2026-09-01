@@ -223,12 +223,12 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
                 {isProcessed ? (
                   <>
                     <h2>Document Analysis Complete</h2>
-                    <p>Your document has been successfully processed! You can now ask any question about the contents of the document.</p>
+                    <p>Your document(s) have been successfully processed! You can now ask any question about their contents — including questions that combine information across multiple uploaded documents.</p>
                   </>
                 ) : (
                   <>
                     <h2>Cogni Document RAG</h2>
-                    <p>Upload a document (up to 400 pages) and ask questions. Cogni will extract text, analyze tables and images, and answer using the strict accuracy guidelines.</p>
+                    <p>Upload one or more documents (up to 400 pages each) and ask questions. Cogni will extract text, analyze tables and images, and answer using the strict accuracy guidelines — combining information across documents when needed.</p>
                   </>
                 )}
               </>
@@ -241,6 +241,7 @@ function MainChat({ apiKey, isUploading, isProcessed, deviceId, activeChatId, se
                   style={{ width: '250px', height: '250px', margin: '0 auto' }}
                 />
                 <p className="upload-notice" style={{ marginTop: '20px', fontWeight: 'bold' }}>⚡ File processing started. Follow progress in the right sidebar.</p>
+                <p className="upload-hint">Uploading multiple files? They'll process one at a time and all be available in this chat.</p>
               </div>
             )}
           </div>
