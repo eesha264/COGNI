@@ -19,7 +19,7 @@ langchain-community==0.4.2
 motor==3.7.1
 tavily-python==0.7.27
 presidio-analyzer==2.2.364
-spacy==3.8.15
+spacy==3.8.16
 # MCP client support — lets query_rag merge in tools from external MCP servers
 # (GitHub, filesystem, etc.) over SSE transport. langchain-mcp-adapters converts
 # MCP tool specs into LangChain BaseTool objects so bind_tools works unchanged.
@@ -28,7 +28,7 @@ spacy==3.8.15
 langchain-mcp-adapters==0.3.2
 mcp>=1.24.0,<2.0.0
 # spaCy's model isn't pip-installable by name — after installing the above,
-# run: python -m spacy download en_core_web_sm (pins to spacy==3.8.15's
+# run: python -m spacy download en_core_web_sm (pins to spacy==3.8.16's
 # compatible model release, currently en_core_web_sm 3.8.0). en_core_web_sm
 # over en_core_web_lg: 15MB vs 432MB, <1 point NER F-score difference — see
 # the comment in pii_guard.py.
