@@ -51,6 +51,16 @@ _vector_store_lock = threading.Lock()
 # M6 fix: cap the cache size to prevent unbounded memory growth.
 _MAX_VECTOR_STORE_CACHE = 50
 
+# Anti-hallucination fix #4: cache describe_table's result per raw table
+# name. A table's schema (columns, types, row count, sample rows) is fixed
+# once process_pdf finishes ingesting it — a re-upload gets a fresh
+# document_id (and therefore a fresh raw table name), so this is safe to
+# keep indefinitely. Without this, a conversation that inspects the same
+# table across several questions burns a describe_table round every single
+# time, eating into the fixed tool-call budget for no reason.
+_table_describe_cache: dict[str, dict] = {}
+_table_describe_lock = threading.Lock()
+
 
 def get_vector_store(collection_name: str) -> Chroma:
     """Return (and cache) a Chroma store for the given per-document collection."""
@@ -592,6 +602,72 @@ def _extract_retry_seconds(err_str: str) -> int:
     return 0
 
 
+# --- Anti-hallucination fixes for the tool-calling loop ---
+# The tool-calling loop appears 3 times in query_rag (primary attempt,
+# same-provider retry, and provider failover). These two helpers are shared
+# by all 3 call sites, instead of being copy-pasted, so a fix here can't
+# silently fail to apply to one of the copies.
+
+async def _ainvoke_with_retry(llm_with_tools, messages, max_retries: int = 2):
+    """Invoke the LLM with in-place retry on a rate-limit error, instead of
+    letting it propagate out of the tool-calling loop. Without this, a 429
+    on (say) round 4 of 5 discards all the work already done in rounds 1-3
+    (the caller's broader retry/failover logic restarts the whole question
+    from scratch), which both wastes API calls and makes hitting the round
+    cap on the next attempt more likely — directly feeding the failure mode
+    below."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await llm_with_tools.ainvoke(messages)
+        except Exception as e:
+            err_str = str(e)
+            if attempt < max_retries and _is_rate_limit(err_str):
+                delay = _extract_retry_seconds(err_str) or (2 ** attempt)
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+
+# Tools whose whole purpose is producing a number the model must not
+# estimate itself (the system prompt explicitly tells it not to). If one of
+# these is still pending when the round cap is hit, the model has not
+# actually computed the answer yet.
+_COMPUTE_TOOLS = {"aggregate_column", "calculator", "query_table", "join_tables", "compare_tables"}
+
+
+async def _finalize_after_round_cap(llm, messages, ai_msg) -> str:
+    """Called when the tool-calling loop hits max_tool_rounds while the model
+    still wants to call more tools. Refuses instead of guessing when a
+    computation tool is still pending — letting the model "answer based on
+    tool results so far" in that case is exactly how a guessed number ends
+    up presented as a real, computed one. If the pending call was just
+    another lookup (not a computation), a best-effort final answer is safe
+    to ask for."""
+    pending_names = {c.get("name") for c in (getattr(ai_msg, "tool_calls", None) or [])}
+    if pending_names & _COMPUTE_TOOLS:
+        return (
+            "I found relevant data but ran out of steps before completing the "
+            "exact calculation, so I don't have a verified number to give you. "
+            "Try asking about one document or table at a time — that usually "
+            "finishes within the step limit."
+        )
+    final_msg = await llm.ainvoke(messages + [HumanMessage(
+        content="Please provide a final answer based on the tool results above. Do not call any more tools."
+    )])
+    fc = final_msg.content
+    if isinstance(fc, list):
+        parts = []
+        for part in fc:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                parts.append(part["text"])
+            else:
+                parts.append(str(part))
+        fc = "".join(parts) if parts else ""
+    return fc or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+
+
 # --- Phase 3: Smart routing ---
 # Keywords that indicate a question needs table tools (and therefore the
 # provider with reliable tool calling — Gemini). Questions without these
@@ -870,7 +946,12 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
             table_name: The table name returned by list_tables."""
         try:
             raw = _resolve_table(table_name)
-            desc = _table_store.describe_table(raw)
+            with _table_describe_lock:
+                desc = _table_describe_cache.get(raw)
+            if desc is None:
+                desc = _table_store.describe_table(raw)
+                with _table_describe_lock:
+                    _table_describe_cache[raw] = desc
             cols = ", ".join(f"{c['name']} ({c['type']})" for c in desc["columns"])
             sample = "\n".join(f"  {row}" for row in desc["sample_rows"])
             # Use the human-readable label, not the raw name
@@ -1140,15 +1221,23 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
     messages.append(HumanMessage(content=question))
 
     tools_used = []
-    max_tool_rounds = 5
+    # Anti-hallucination fix: the documented workflow for cross-document
+    # table joins (list_tables -> describe_table x2 -> join_tables ->
+    # aggregate_column) needs 5 calls minimum with zero margin for anything
+    # going slightly differently. Raised to give real headroom instead of
+    # routinely hitting the cap one step before the actual computation.
+    max_tool_rounds = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 
     # Invoke, looping while the model keeps requesting tool calls (some models
     # call tools one at a time across several turns rather than all at once)
     try:
-        ai_msg = await llm_with_tools.ainvoke(messages)
+        ai_msg = await _ainvoke_with_retry(llm_with_tools, messages)
 
         rounds = 0
         while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
+            # Debug: log which tools are being called each round
+            _tool_names = [c.get("name", "?") for c in ai_msg.tool_calls]
+            print(f"[DEBUG] Tool round {rounds+1}/{max_tool_rounds}: calling {_tool_names}", flush=True)
             # Gemini 3.x requires thought_signatures in function call parts.
             # The langchain-google-genai package stores these in
             # response_metadata — so we MUST append the original ai_msg
@@ -1185,33 +1274,17 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
                 else:
                     result = f"Error: unknown tool '{call_name}'"
                 messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
-            ai_msg = await llm_with_tools.ainvoke(messages)
+            ai_msg = await _ainvoke_with_retry(llm_with_tools, messages)
             rounds += 1
 
-        # H10 fix: if we hit max_tool_rounds and the model is still requesting
-        # tools, do a final invoke WITHOUT tools bound so it must produce a
-        # text answer instead of returning an empty/tool-call-only message.
-        # M10 fix: don't append ai_msg (which has tool_calls but no matching
-        # ToolMessages) — just invoke with the existing messages.
-        # Gemini doesn't support "model prefilling" (AIMessage as the last
-        # message), so we add a HumanMessage prompting the model to answer.
+        # H10 fix, now via _finalize_after_round_cap: if we hit max_tool_rounds
+        # and the model is still requesting tools, refuse rather than guess
+        # when a computation tool is still pending — see that helper's
+        # docstring for why. Gemini doesn't support "model prefilling"
+        # (AIMessage as the last message), so the helper appends a
+        # HumanMessage prompting the model to answer, not the raw ai_msg.
         if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
-            final_msg = await llm.ainvoke(messages + [HumanMessage(
-                content="Please provide a final answer based on the tool results above. Do not call any more tools."
-            )])
-            # Normalize Gemini list content to string
-            fc = final_msg.content
-            if isinstance(fc, list):
-                parts = []
-                for part in fc:
-                    if isinstance(part, str):
-                        parts.append(part)
-                    elif isinstance(part, dict) and "text" in part:
-                        parts.append(part["text"])
-                    else:
-                        parts.append(str(part))
-                fc = "".join(parts) if parts else ""
-            answer = fc or "(The model exceeded the maximum number of tool calls and could not produce a final answer.)"
+            answer = await _finalize_after_round_cap(llm, messages, ai_msg)
             answer = redact_pii(answer, TokenStore(), entities=RAIL_ENTITIES)
             return {"answer": answer, "tools_used": tools_used, "source_pages": sorted(source_pages_used)}
 
@@ -1254,7 +1327,7 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
             if wait_secs and wait_secs <= 30:
                 await asyncio.sleep(wait_secs)
                 try:
-                    ai_msg = await llm_with_tools.ainvoke(messages)
+                    ai_msg = await _ainvoke_with_retry(llm_with_tools, messages)
                     rounds = 0
                     while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
                         messages.append(ai_msg)
@@ -1273,9 +1346,17 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
                             else:
                                 result = f"Error: unknown tool"
                             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-                        ai_msg = await llm_with_tools.ainvoke(messages)
+                        ai_msg = await _ainvoke_with_retry(llm_with_tools, messages)
                         rounds += 1
-                    raw_content = ai_msg.content
+                    # This path previously had no H10 handling at all: if the
+                    # round cap was hit here, ai_msg.content would typically
+                    # be empty (a tool-call-only response) and that empty
+                    # string would be returned as the answer. Now shares the
+                    # same refuse-if-still-computing helper as the main path.
+                    if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
+                        raw_content = await _finalize_after_round_cap(llm, messages, ai_msg)
+                    else:
+                        raw_content = ai_msg.content
                     if isinstance(raw_content, list):
                         parts = []
                         for part in raw_content:
@@ -1320,7 +1401,7 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
                         retry_messages.append(AIMessage(content=content))
                 retry_messages.append(HumanMessage(content=question))
 
-                ai_msg = await llm_with_tools.ainvoke(retry_messages)
+                ai_msg = await _ainvoke_with_retry(llm_with_tools, retry_messages)
                 retry_tools_used = []
                 rounds = 0
                 while getattr(ai_msg, "tool_calls", None) and rounds < max_tool_rounds:
@@ -1340,18 +1421,16 @@ async def query_rag(question: str, groq_api_key: str, history=None, document_ids
                         else:
                             result = f"Error: unknown tool"
                         retry_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-                    ai_msg = await llm_with_tools.ainvoke(retry_messages)
+                    ai_msg = await _ainvoke_with_retry(llm_with_tools, retry_messages)
                     rounds += 1
 
-                # H10 fix for fallback: force a final text answer if still
-                # requesting tools after max rounds.
+                # H10 fix for fallback: refuse rather than guess if still
+                # requesting a computation tool after max rounds (same helper
+                # as the primary and same-provider-retry paths).
                 if getattr(ai_msg, "tool_calls", None) and rounds >= max_tool_rounds:
-                    final_msg = await llm.ainvoke(retry_messages + [HumanMessage(
-                        content="Please provide a final answer based on the tool results above. Do not call any more tools."
-                    )])
-                    ai_msg = final_msg
-
-                raw_content = ai_msg.content
+                    raw_content = await _finalize_after_round_cap(llm, retry_messages, ai_msg)
+                else:
+                    raw_content = ai_msg.content
                 if isinstance(raw_content, list):
                     parts = []
                     for part in raw_content:
